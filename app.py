@@ -6,6 +6,7 @@ import hmac
 import json
 import math
 import os
+import secrets
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -22,6 +23,7 @@ VISITOR_LOG_FILE = "student_visitors_log.csv"
 STUDENT_DB_FILE = "saved_students_compact.json"
 ADMIN_GLOBAL_EXTRAS_FILE = "admin_global_extras.json"
 TIMETABLE_IMG_PATH = "timetable.jpg"
+SERVER_SECRET_KEY_FILE = ".server_cookie_secret.key"
 
 # SECURITY CLEANUP: Immediately delete any old shared server session file if it exists
 if os.path.exists(".remembered_session.json"):
@@ -31,9 +33,47 @@ if os.path.exists(".remembered_session.json"):
         pass
 
 
-# --- SECURITY & HELPER FUNCTIONS ---
+# --- SECURITY & CRYPTOGRAPHIC HELPERS (ZERO HARDCODED SECRETS IN CODE) ---
+def get_server_cookie_secret() -> str:
+    """
+    1. Reads COOKIE_SECRET_SALT from st.secrets if set.
+    2. Otherwise generates a private 256-bit random key stored only on the server's local disk
+       (never in GitHub code), so no one can ever forge browser cookies!
+    """
+    try:
+        if "COOKIE_SECRET_SALT" in st.secrets:
+            return str(st.secrets["COOKIE_SECRET_SALT"])
+    except Exception:
+        pass
+
+    if os.path.exists(SERVER_SECRET_KEY_FILE):
+        try:
+            with open(SERVER_SECRET_KEY_FILE, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+                if len(key) >= 32:
+                    return key
+        except Exception:
+            pass
+
+    new_key = secrets.token_hex(32)
+    try:
+        with open(SERVER_SECRET_KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(new_key)
+    except Exception:
+        pass
+    return new_key
+
+
+COOKIE_SECRET_SALT = get_server_cookie_secret()
+
+
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.strip().encode("utf-8")).hexdigest()
+    """Salted HMAC-SHA256 password hashing so rainbow tables can never crack passwords."""
+    return hmac.new(
+        COOKIE_SECRET_SALT.encode("utf-8"),
+        password.strip().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def get_admin_email() -> str:
@@ -42,55 +82,39 @@ def get_admin_email() -> str:
             return str(st.secrets["ADMIN_EMAIL"]).strip().lower()
     except Exception:
         pass
-    return "honraokanishka@gmail.com"
-
-
-def get_admin_password_hash() -> str:
-    """
-    Reads ADMIN_PASSWORD_PLAIN from Streamlit Secrets if configured;
-    otherwise uses the irreversible SHA-256 hash so the plain-text password
-    is NEVER exposed in GitHub source code.
-    """
-    try:
-        if "ADMIN_PASSWORD_PLAIN" in st.secrets:
-            return hash_password(str(st.secrets["ADMIN_PASSWORD_PLAIN"]))
-        if "ADMIN_PASSWORD_HASH" in st.secrets:
-            return str(st.secrets["ADMIN_PASSWORD_HASH"]).strip().lower()
-    except Exception:
-        pass
-   
-    return "341e4d0758c9b07c8671ab4fc1be9e3121a9f199c7424e4c924136461586f861"
-
-
-def get_cookie_secret_salt() -> str:
-    try:
-        if "COOKIE_SECRET_SALT" in st.secrets:
-            return str(st.secrets["COOKIE_SECRET_SALT"])
-    except Exception:
-        pass
-    return "DBIT_SECURE_SALT_2026_KMH"
-
-
-ADMIN_EMAIL = get_admin_email()
-ADMIN_PASSWORD_HASH = get_admin_password_hash()
-COOKIE_SECRET_SALT = get_cookie_secret_salt()
+    return os.environ.get("ADMIN_EMAIL", "").strip().lower()
 
 
 def verify_admin_password(input_pw: str) -> bool:
+    """
+    Verifies Admin Password strictly against Streamlit Secrets (st.secrets["ADMIN_PASSWORD_PLAIN"])
+    or environment variable. Nothing is hardcoded in source code!
+    """
     if not input_pw:
         return False
-    return hmac.compare_digest(hash_password(input_pw), ADMIN_PASSWORD_HASH)
+    secret_plain = None
+    try:
+        if "ADMIN_PASSWORD_PLAIN" in st.secrets:
+            secret_plain = str(st.secrets["ADMIN_PASSWORD_PLAIN"]).strip()
+    except Exception:
+        pass
+    if not secret_plain:
+        secret_plain = os.environ.get("ADMIN_PASSWORD_PLAIN", "").strip()
+    if not secret_plain:
+        return False
+    return hmac.compare_digest(input_pw.strip(), secret_plain)
+
+
+ADMIN_EMAIL = get_admin_email()
 
 
 def create_browser_auth_token(email: str, pw_hash: str) -> str:
-    """Creates a signed token tied to a specific email and password hash for the user's browser cookie."""
     msg = f"{email.strip().lower()}:{pw_hash}".encode("utf-8")
     sig = hmac.new(COOKIE_SECRET_SALT.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return f"{email.strip().lower()}|{sig}"
 
 
 def verify_browser_auth_token(token_str: str, all_db: dict):
-    """Verifies a browser cookie token against the student database. Returns email if valid, else None."""
     if not token_str or "|" not in str(token_str):
         return None
     try:
@@ -239,10 +263,9 @@ def update_student_visit(email, name, branch, batch):
     log_df.to_csv(VISITOR_LOG_FILE, index=False)
 
 
-# --- INITIALIZE PER-BROWSER COOKIE MANAGER (ISOLATED PER DEVICE/PHONE) ---
+# --- INITIALIZE PER-BROWSER COOKIE MANAGER ---
 cookie_manager = stx.CookieManager(key="secure_student_cookie_mgr")
 
-# SECURITY FIX: Never allow ?email= or ?token= in the URL bar so shared links NEVER leak accounts
 if "email" in st.query_params or "token" in st.query_params or "logged_out" in st.query_params:
     st.query_params.clear()
 
@@ -324,7 +347,7 @@ def render_side_guide_card(step_num, total_steps, title, message, state_key, arr
     )
 
 
-# --- GLOBAL & MOBILE-RESPONSIVE CSS ---
+# --- GLOBAL & ANDROID/DESKTOP SMOOTH TIMETABLE CSS ---
 st.markdown(
     """
     <style>
@@ -392,14 +415,14 @@ st.markdown(
     .blinking-batch-badge {
         background-color: #dc2626;
         color: #ffffff;
-        padding: 3px 7px;
+        padding: 3px 8px;
         border-radius: 5px;
         font-weight: 800;
         font-size: 11px;
         border: 1px solid #fecaca;
         animation: blinker 1s linear infinite;
         display: inline-block;
-        margin-top: 4px;
+        margin-top: 5px;
     }
     .guide-callout-box {
         background: linear-gradient(135deg, #0f172a, #1e3a8a);
@@ -483,65 +506,127 @@ st.markdown(
     }
     .cal-sub { font-size: 9px; font-weight: 800; margin-top: 2px; line-height: 1.05; word-break: break-word; }
 
+    /* --- SMOOTH HARDWARE-ACCELERATED TIMETABLE (DESKTOP & ANDROID) --- */
     .tt-scroll-wrapper {
         width: 100%;
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
-        border-radius: 8px;
+        overscroll-behavior-x: contain;
+        border-radius: 10px;
+        border: 2px solid #475569;
         margin-top: 8px;
+        background: #0f172a;
+        transform: translateZ(0);
     }
     .vertical-tt-table {
         width: 100%;
-        min-width: 680px;
-        border-collapse: collapse;
-        font-family: 'Segoe UI', sans-serif;
+        min-width: 920px; /* Guarantees spacious, uncramped columns on Android & Desktop */
+        border-collapse: separate;
+        border-spacing: 0;
+        table-layout: fixed;
+        font-family: 'Segoe UI', system-ui, sans-serif;
     }
     .vertical-tt-table th {
         background-color: #1e293b;
         color: #f8fafc;
-        font-size: 15px;
+        font-size: 14.5px;
         font-weight: 800;
-        padding: 12px 10px;
-        border: 2px solid #475569;
+        padding: 14px 10px;
+        border-bottom: 2px solid #475569;
+        border-right: 1.5px solid #475569;
         text-align: center;
+        width: 17.2%;
+    }
+    .vertical-tt-table th:first-child {
+        width: 14%;
+        position: sticky;
+        left: 0;
+        z-index: 3;
+        background-color: #0f172a;
+        border-right: 2.5px solid #38bdf8;
     }
     .vertical-tt-table td {
         padding: 14px 10px;
-        border: 2px solid #475569;
+        border-bottom: 1.5px solid #475569;
+        border-right: 1.5px solid #475569;
         text-align: center;
         vertical-align: middle;
         font-size: 13.5px;
-        line-height: 1.4;
-        min-height: 68px;
+        line-height: 1.45;
+        word-wrap: break-word;
+        overflow-wrap: break-word;
     }
     .tt-slot-col {
-        background-color: #0f172a;
-        color: #e2e8f0;
+        background-color: #0f172a !important;
+        color: #e2e8f0 !important;
         font-weight: 800;
-        font-size: 13px;
-        width: 14%;
+        font-size: 12.5px;
+        position: sticky;
+        left: 0;
+        z-index: 2;
+        border-right: 2.5px solid #38bdf8 !important;
     }
     .tt-cell-green {
-        background-color: rgba(34, 197, 94, 0.28);
-        color: #bbf7d0;
+        background-color: rgba(22, 163, 74, 0.32);
+        color: #dcfce7;
         font-weight: 700;
     }
     .tt-cell-yellow {
-        background-color: rgba(234, 179, 8, 0.32);
+        background-color: rgba(202, 138, 4, 0.35);
         color: #fef08a;
         font-weight: 700;
     }
     .tt-cell-red {
-        background-color: #ef4444;
+        background-color: #dc2626;
         color: #ffffff;
         font-weight: 800;
         letter-spacing: 0.5px;
     }
     .tt-cell-blue {
-        background-color: rgba(59, 130, 246, 0.22);
-        color: #bfdbfe;
+        background-color: rgba(37, 99, 235, 0.24);
+        color: #dbeafe;
         font-weight: 600;
     }
+
+    /* --- SMOOTH MOBILE DAY-CARD TIMETABLE VIEW --- */
+    .mob-tt-card {
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 10px;
+        border: 1.5px solid #475569;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        box-shadow: 0 3px 8px rgba(0, 0, 0, 0.25);
+        font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    .mob-tt-slot-badge {
+        background: #0f172a;
+        color: #38bdf8;
+        font-weight: 800;
+        font-size: 12.5px;
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid #38bdf8;
+        min-width: 118px;
+        text-align: center;
+        flex-shrink: 0;
+    }
+    .mob-tt-details {
+        flex-grow: 1;
+        text-align: left;
+    }
+    .mob-tt-title {
+        font-size: 15px;
+        font-weight: 800;
+        margin-bottom: 3px;
+    }
+    .mob-tt-meta {
+        font-size: 12.5px;
+        opacity: 0.92;
+    }
+
     .creator-footer {
         text-align: center;
         margin-top: 40px;
@@ -556,14 +641,14 @@ st.markdown(
     /* --- MOBILE SCREEN OPTIMIZATIONS (ANDROID & IOS) --- */
     @media (max-width: 768px) {
         .block-container {
-            padding-left: 0.6rem !important;
-            padding-right: 0.6rem !important;
-            padding-top: 1.2rem !important;
+            padding-left: 0.55rem !important;
+            padding-right: 0.55rem !important;
+            padding-top: 1.1rem !important;
         }
-        h1 { font-size: 1.55rem !important; }
-        h2, h3 { font-size: 1.2rem !important; }
+        h1 { font-size: 1.5rem !important; }
+        h2, h3 { font-size: 1.15rem !important; }
         .missed-lectures-banner {
-            font-size: 15px !important;
+            font-size: 14.5px !important;
             padding: 10px 12px !important;
         }
         [data-testid="stHorizontalBlock"]:has(.cal-cell),
@@ -598,6 +683,18 @@ st.markdown(
             font-size: 9.5px !important;
             min-height: 24px !important;
             height: 24px !important;
+        }
+        .mob-tt-card {
+            padding: 11px 12px !important;
+            gap: 10px !important;
+        }
+        .mob-tt-slot-badge {
+            min-width: 102px !important;
+            font-size: 11.5px !important;
+            padding: 5px 7px !important;
+        }
+        .mob-tt-title {
+            font-size: 14px !important;
         }
     }
     </style>
@@ -808,7 +905,7 @@ def hydrate_semesters_for_user(user_obj):
     return sem_dict_out
 
 
-# --- PER-DEVICE BROWSER COOKIE AUTO-LOGIN (100% ISOLATED PER USER PHONE/PC) ---
+# --- PER-DEVICE BROWSER COOKIE AUTO-LOGIN ---
 if "student_logged_in" not in st.session_state:
     st.session_state.student_logged_in = False
 
@@ -868,7 +965,7 @@ if not st.session_state.get("student_logged_in", False):
             elif not clean_pw:
                 st.error("Please enter a password.")
             else:
-                if clean_email == ADMIN_EMAIL and not verify_admin_password(clean_pw):
+                if ADMIN_EMAIL and clean_email == ADMIN_EMAIL and not verify_admin_password(clean_pw):
                     st.error("Invalid password for Admin Gmail account.")
                     st.stop()
 
@@ -879,20 +976,20 @@ if not st.session_state.get("student_logged_in", False):
                 if is_existing_user:
                     user_obj = all_db[clean_email]
                     stored_hash = user_obj.get("password_hash", "")
-                    if stored_hash and stored_hash != pw_hashed and clean_email != ADMIN_EMAIL:
+                    if stored_hash and stored_hash != pw_hashed and (not ADMIN_EMAIL or clean_email != ADMIN_EMAIL):
                         st.error("Incorrect password for this Gmail account.")
                         st.stop()
-                    final_name = clean_name if clean_name else user_obj.get("name", "Kanishka Maya Honrao" if clean_email == ADMIN_EMAIL else "Student")
+                    final_name = clean_name if clean_name else user_obj.get("name", "Student")
                     final_branch = user_obj.get("branch", input_branch)
                     final_batch = user_obj.get("batch", input_batch)
                     guide_done = True
                     st.session_state.dashboard_guide_step = 99
                 else:
-                    if not clean_name and clean_email != ADMIN_EMAIL:
+                    if not clean_name and (not ADMIN_EMAIL or clean_email != ADMIN_EMAIL):
                         st.error("First-time registration requires your Real Full Name.")
                         st.stop()
                     user_obj = {}
-                    final_name = clean_name if clean_name else "Kanishka Maya Honrao"
+                    final_name = clean_name if clean_name else "Admin"
                     final_branch = input_branch
                     final_batch = input_batch
                     guide_done = False
@@ -1052,14 +1149,14 @@ st.sidebar.write(f"**Email:** {st.session_state.student_email}")
 st.sidebar.write(f"**Branch:** {st.session_state.student_branch}")
 st.sidebar.write(f"**Batch:** {st.session_state.get('student_batch', 'Batch A')}")
 
-# --- ADMIN POWER PANEL (EXCLUSIVELY FOR KANISHKA VIA HASH/SECRETS VERIFICATION) ---
-is_kanishka = st.session_state.student_email.strip().lower() == ADMIN_EMAIL
+# --- ADMIN POWER PANEL (READS STRICTLY FROM ST.SECRETS) ---
+is_kanishka = bool(ADMIN_EMAIL) and (st.session_state.student_email.strip().lower() == ADMIN_EMAIL)
 if is_kanishka:
     st.sidebar.markdown("---")
     st.sidebar.header("Admin Power Panel")
     admin_auth = st.sidebar.text_input("Enter Admin Password:", type="password", key="sidebar_admin_pwd")
     if verify_admin_password(admin_auth):
-        st.sidebar.success("Admin Power Unlocked (Linked to your Gmail)")
+        st.sidebar.success("Admin Power Unlocked (Verified via Streamlit Secrets)")
         global_extras_current = load_admin_global_extras()
         st.sidebar.write("**Broadcast Extra Lectures (Visible to Everyone Else Other Than You):**")
         target_sem_for_admin = st.sidebar.selectbox("Select Semester:", list(SEMESTER_DATA.keys()), key="admin_sem_pick")
@@ -1092,7 +1189,7 @@ if is_kanishka:
             else:
                 st.write("No students have logged in yet.")
     elif admin_auth:
-        st.sidebar.error("Incorrect Admin Password.")
+        st.sidebar.error("Incorrect Admin Password (or ADMIN_PASSWORD_PLAIN not set in st.secrets).")
 
 if st.sidebar.button("Switch Student / Logout", disabled=guide_is_active):
     try:
@@ -1149,7 +1246,7 @@ target_credits = st.sidebar.number_input(
 # --- HELPER TO COMPUTE DERIVED COLUMNS ---
 def compute_attendance_metrics(base_df, target_pct_val: int, current_user_email: str):
     t_ratio = target_pct_val / 100.0
-    is_admin_user = current_user_email.strip().lower() == ADMIN_EMAIL
+    is_admin_user = bool(ADMIN_EMAIL) and (current_user_email.strip().lower() == ADMIN_EMAIL)
     global_extras = load_admin_global_extras()
 
     df = base_df.copy()
@@ -1814,14 +1911,14 @@ with sec4_wrapper:
                 arrow_dir="left",
             )
 
-# --- SECTION 5: VERTICAL LARGE TIMETABLE (MERGED BULK CELLS WITH ROWSPAN + MOBILE SCROLL) ---
+# --- SECTION 5: SMOOTH ANDROID & DESKTOP TIMETABLE (DAY-CARD VIEW + FULL 5-DAY GRID VIEW) ---
 sec5_wrapper = st.container()
 with sec5_wrapper:
     if guide_is_active and active_step in [1, 2, 3]:
         st.markdown('<div class="blur-target-block"></div>', unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("5. Vertical Timetable (Merged Bulk Lectures + Batch-Specific Lab Attendance) & Image Manager")
+    st.subheader("5. Interactive Timetable (Smooth Mobile Cards + Full 5-Day Desktop Grid) & Image Manager")
 
     if guide_is_active and active_step == 4:
         s5_col_main, s5_col_guide = st.columns([2.2, 1])
@@ -1832,7 +1929,84 @@ with sec5_wrapper:
     student_batch = st.session_state.get("student_batch", "Batch A")
     batch_letter = student_batch[-1].upper()
 
+    def build_mobile_day_cards_html(grid_dict, chosen_day: str):
+        """
+        Renders a sleek, zero-cramping vertical card stack for a single day on Android/iOS,
+        automatically merging continuous multi-hour bulk blocks (e.g., CP 3-4 or 2-hr Labs).
+        """
+        day_slots = grid_dict[chosen_day]
+        num_slots = len(TIME_SLOTS)
+        html = '<div style="margin-top: 8px;">'
+
+        s_i = 0
+        while s_i < num_slots:
+            raw_val = day_slots[s_i]
+            batch_entry, is_batch_lab = extract_batch_specific_entry(raw_val, batch_letter)
+            matched_sf = match_subject_short_form(batch_entry, subject_stats_by_short)
+
+            span = 1
+            if matched_sf and s_i < 8:
+                while (
+                    s_i + span < 8
+                    and match_subject_short_form(
+                        extract_batch_specific_entry(day_slots[s_i + span], batch_letter)[0],
+                        subject_stats_by_short,
+                    )
+                    == matched_sf
+                ):
+                    span += 1
+
+            if span > 1:
+                start_t = TIME_SLOTS[s_i].split("(")[1].split("-")[0].strip()
+                end_t = TIME_SLOTS[s_i + span - 1].split("-")[1].split(")")[0].strip()
+                slot_badge_text = f"Slots {s_i+1}-{s_i+span}<br>{start_t} - {end_t}"
+                title_html = f"{batch_entry} <span style='font-size:12px; color:#38bdf8;'>[1 Combined Bulk Unit ({span} Hrs)]</span>"
+            else:
+                slot_badge_text = TIME_SLOTS[s_i].replace(" (", "<br>(")
+                title_html = batch_entry
+
+            card_bg = "rgba(37, 99, 235, 0.22)"
+            card_color = "#dbeafe"
+            meta_html = "Non-Credit / Extra Slot"
+
+            if "BREAK" in raw_val:
+                card_bg = "#dc2626"
+                card_color = "#ffffff"
+                meta_html = "Official Break"
+            elif matched_sf and matched_sf in subject_stats_by_short:
+                info = subject_stats_by_short[matched_sf]
+                if info["pct"] >= target_att_pct:
+                    card_bg = "rgba(22, 163, 74, 0.30)"
+                    card_color = "#dcfce7"
+                    status_tag = f"Safe (Can bunk {info['bunks']})"
+                else:
+                    card_bg = "rgba(202, 138, 4, 0.34)"
+                    card_color = "#fef08a"
+                    status_tag = f"Need {info['needed']} for {target_att_pct}%"
+                meta_html = f"Attendance: <b>{info['pct']}%</b> | Missed: <b>{info['unattended']}/{info['total']}</b> | {status_tag}"
+
+            if is_batch_lab:
+                title_html += f' <span class="blinking-batch-badge">YOUR {student_batch.upper()} LAB</span>'
+
+            html += f"""
+            <div class="mob-tt-card" style="background:{card_bg}; color:{card_color};">
+                <div class="mob-tt-slot-badge">{slot_badge_text}</div>
+                <div class="mob-tt-details">
+                    <div class="mob-tt-title">{title_html}</div>
+                    <div class="mob-tt-meta">{meta_html}</div>
+                </div>
+            </div>
+            """
+            s_i += span
+
+        html += "</div>"
+        return html
+
     def build_vertical_timetable_html(grid_dict):
+        """
+        Full 5-Day Desktop & Smooth Android Horizontal-Scroll Grid with fixed column widths
+        and sticky time-slot headers so columns never squish or glitch on mobile.
+        """
         days_order = ["MON", "TUE", "WED", "THR", "FRI"]
         num_slots = len(TIME_SLOTS)
 
@@ -1908,19 +2082,35 @@ with sec5_wrapper:
         return html
 
     with s5_col_main:
+        layout_mode = st.radio(
+            "Select Timetable Layout Mode:",
+            ["Full 5-Day Grid (Smooth Scroll on Mobile & Desktop)", "Day-by-Day Mobile Card View (Zero Horizontal Scroll)"],
+            horizontal=True,
+            index=0,
+            disabled=guide_is_active,
+        )
+
         tt_tab1, tt_tab2, tt_tab3 = st.tabs([
-            "Even Week Vertical Timetable",
-            "Odd Week Vertical Timetable",
+            "Even Week Timetable",
+            "Odd Week Timetable",
             "Official Timetable Image (Upload / Paste / Remove)",
         ])
 
         with tt_tab1:
-            st.caption(f"**Even Week Effective Dates:** 21–25 Sept | 5–9 Oct | 26–30 Oct | 9–13 Nov | 23–27 Nov 2026 (Swipe left/right on mobile | Batch: **{student_batch}** | Target: {target_att_pct}%)")
-            st.markdown(build_vertical_timetable_html(EVEN_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
+            st.caption(f"**Even Week Effective Dates:** 21–25 Sept | 5–9 Oct | 26–30 Oct | 9–13 Nov | 23–27 Nov 2026 (Batch: **{student_batch}** | Target: {target_att_pct}%)")
+            if "Day-by-Day" in layout_mode:
+                even_day_pick = st.radio("Select Day (Even Week):", ["MON", "TUE", "WED", "THR", "FRI"], horizontal=True, key="even_mob_day")
+                st.markdown(build_mobile_day_cards_html(EVEN_WEEK_TIMETABLE_GRID, even_day_pick), unsafe_allow_html=True)
+            else:
+                st.markdown(build_vertical_timetable_html(EVEN_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
 
         with tt_tab2:
-            st.caption(f"**Odd Week Effective Dates:** 7–11 Sept | 28 Sept–2 Oct | 12–16 Oct | 1–6 Nov | 16–20 Nov | 30 Nov–4 Dec 2026 (Swipe left/right on mobile | Batch: **{student_batch}** | Target: {target_att_pct}%)")
-            st.markdown(build_vertical_timetable_html(ODD_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
+            st.caption(f"**Odd Week Effective Dates:** 7–11 Sept | 28 Sept–2 Oct | 12–16 Oct | 1–6 Nov | 16–20 Nov | 30 Nov–4 Dec 2026 (Batch: **{student_batch}** | Target: {target_att_pct}%)")
+            if "Day-by-Day" in layout_mode:
+                odd_day_pick = st.radio("Select Day (Odd Week):", ["MON", "TUE", "WED", "THR", "FRI"], horizontal=True, key="odd_mob_day")
+                st.markdown(build_mobile_day_cards_html(ODD_WEEK_TIMETABLE_GRID, odd_day_pick), unsafe_allow_html=True)
+            else:
+                st.markdown(build_vertical_timetable_html(ODD_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
 
         with tt_tab3:
             if os.path.exists(TIMETABLE_IMG_PATH):
@@ -2022,7 +2212,7 @@ with sec5_wrapper:
                 4,
                 4,
                 "Step 4: Merged Bulk Timetable & Batch Lab Attendance",
-                "This arrow points to Section 5. Multi-hour bulk lectures like CP and 2-hour labs are merged into 1 combined block, and your batch labs highlight automatically. Click 'Got it' to finish!",
+                "This arrow points to Section 5. Switch between the Full 5-Day Grid (with sticky time column) or Day-by-Day Mobile Cards on Android. Click 'Got it' to finish!",
                 "dashboard_guide_step",
                 arrow_dir="left",
                 finish_tour=True,
