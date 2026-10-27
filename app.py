@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Page Configuration (Removed DBIT from title)
+# Page Configuration
 st.set_page_config(
     page_title="Attendance & Interactive Calendar Tracker",
     layout="wide",
@@ -17,6 +17,7 @@ st.set_page_config(
 
 VISITOR_LOG_FILE = "student_visitors_log.csv"
 STUDENT_DB_FILE = "saved_students_compact.json"
+REMEMBER_ME_FILE = ".remembered_session.json"
 TIMETABLE_IMG_PATH = "timetable.jpg"
 
 # Exclusive Admin Email (Admin log is ONLY visible when logged in with this email + password)
@@ -51,6 +52,33 @@ def load_all_students_db():
         except Exception:
             return {}
     return {}
+
+
+def save_local_remembered_session(email: str, token: str):
+    """Saves login session to disk so restarting `streamlit run app.py` never asks to login again."""
+    try:
+        with open(REMEMBER_ME_FILE, "w", encoding="utf-8") as f:
+            json.dump({"email": email.strip().lower(), "token": token}, f)
+    except Exception:
+        pass
+
+
+def load_local_remembered_session():
+    if os.path.exists(REMEMBER_ME_FILE):
+        try:
+            with open(REMEMBER_ME_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def clear_local_remembered_session():
+    if os.path.exists(REMEMBER_ME_FILE):
+        try:
+            os.remove(REMEMBER_ME_FILE)
+        except Exception:
+            pass
 
 
 def save_student_compact(
@@ -137,58 +165,6 @@ def update_student_visit(email, name, branch, batch):
     log_df.to_csv(VISITOR_LOG_FILE, index=False)
 
 
-# --- BROWSER LOCALSTORAGE AUTO-LOGIN HELPERS ---
-def save_credentials_to_browser(email: str, pw_hash: str):
-    components.html(
-        f"""
-        <script>
-        try {{
-            localStorage.setItem("att_saved_email", {json.dumps(email)});
-            localStorage.setItem("att_saved_token", {json.dumps(pw_hash)});
-        }} catch (e) {{}}
-        </script>
-        """,
-        height=0,
-    )
-
-
-def clear_credentials_from_browser():
-    components.html(
-        """
-        <script>
-        try {
-            localStorage.removeItem("att_saved_email");
-            localStorage.removeItem("att_saved_token");
-        } catch (e) {}
-        </script>
-        """,
-        height=0,
-    )
-
-
-def attempt_browser_auto_login():
-    """Reads saved email + password token from browser localStorage and redirects with URL params."""
-    components.html(
-        """
-        <script>
-        (function() {
-            try {
-                const savedEmail = localStorage.getItem("att_saved_email");
-                const savedToken = localStorage.getItem("att_saved_token");
-                const urlParams = new URLSearchParams(window.parent.location.search);
-                if (savedEmail && savedToken && !urlParams.get("email") && !urlParams.get("logged_out")) {
-                    urlParams.set("email", savedEmail);
-                    urlParams.set("token", savedToken);
-                    window.parent.location.search = urlParams.toString();
-                }
-            } catch (e) {}
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
-
 # --- CONTEXTUAL STEP GUIDE BESIDE LINKED ELEMENT ---
 def apply_guide_blur_css():
     st.markdown(
@@ -233,7 +209,7 @@ def render_side_guide_card(step_num, total_steps, title, message, state_key, arr
         """,
         unsafe_allow_html=True,
     )
-    if st.button("Got it", key=f"got_it_{state_key}_{step_num}", type="primary", use_container_width=True):
+    if st.button("Got it", key=f"got_it_{state_key}_{step_num}", type="primary", width="stretch"):
         st.session_state[state_key] += 1
         if finish_tour and st.session_state.get("student_logged_in", False):
             st.session_state.guide_completed = True
@@ -556,10 +532,6 @@ def get_week_type(d: datetime.date):
 
 
 def extract_batch_specific_entry(raw_entry: str, batch_letter: str):
-    """
-    If a timetable slot has batch-separated labs like 'Lab EC (A) / Lab AP (B) / FEM-I Tut (C)',
-    returns ONLY the segment for the student's batch (e.g., 'Lab EC (A)') and True.
-    """
     if "/" in raw_entry and ("(A)" in raw_entry or "(B)" in raw_entry or "(C)" in raw_entry):
         parts = [p.strip() for p in raw_entry.split("/")]
         for part in parts:
@@ -569,10 +541,8 @@ def extract_batch_specific_entry(raw_entry: str, batch_letter: str):
 
 
 def match_subject_short_form(entry_text: str, subject_stats_dict: dict):
-    """Matches a single lecture or batch-specific lab string to its subject short form."""
     if "Workshop" in entry_text or "WS-I" in entry_text:
         return "WS-I" if "WS-I" in subject_stats_dict else None
-    # Sort by length descending so 'FEM-I' matches before 'EM'
     for sf_code in sorted(subject_stats_dict.keys(), key=len, reverse=True):
         if sf_code in entry_text:
             return sf_code
@@ -701,35 +671,39 @@ def hydrate_semesters_for_user(user_obj):
     return sem_dict_out
 
 
-# --- AUTO-LOGIN VIA URL QUERY PARAMS OR BROWSER LOCALSTORAGE ---
+# --- DUAL AUTO-LOGIN: URL QUERY PARAMS + LOCAL REMEMBER-ME FILE ---
 query_params = st.query_params
 saved_email = query_params.get("email", "").strip().lower()
 saved_token = query_params.get("token", "").strip()
+local_rem = load_local_remembered_session()
 
 if "student_logged_in" not in st.session_state:
     all_db = load_all_students_db()
+
+    # If URL doesn't have email, fall back to local `.remembered_session.json` so restarting Streamlit logs right in!
+    if not saved_email and local_rem and not query_params.get("logged_out"):
+        saved_email = local_rem.get("email", "").strip().lower()
+        saved_token = local_rem.get("token", "").strip()
+
     if saved_email and saved_email in all_db:
         user_record = all_db[saved_email]
         stored_pw_hash = user_record.get("password_hash", "")
-        # Authenticate automatically if token matches stored password hash (or legacy account without password yet)
         if (stored_pw_hash and saved_token == stored_pw_hash) or (not stored_pw_hash):
             st.session_state.student_logged_in = True
             st.session_state.student_email = user_record.get("email", saved_email)
             st.session_state.student_name = user_record.get("name", "Student")
             st.session_state.student_branch = user_record.get("branch", BRANCH_OPTIONS[0])
             st.session_state.student_batch = user_record.get("batch", BATCH_OPTIONS[0])
-            st.session_state.guide_completed = user_record.get("guide_completed", True)
+            st.session_state.guide_completed = True
             st.session_state.target_attendance_pct = int(user_record.get("target_attendance_pct", 75))
-            # Skip step guide for returning remembered users
-            st.session_state.dashboard_guide_step = 99 if st.session_state.guide_completed else 1
+            st.session_state.dashboard_guide_step = 99
+            st.query_params["email"] = saved_email
+            if stored_pw_hash:
+                st.query_params["token"] = stored_pw_hash
         else:
             st.session_state.student_logged_in = False
     else:
         st.session_state.student_logged_in = False
-
-if "login_guide_step" not in st.session_state:
-    # Only show login guide if there are no saved users in DB yet, or let user dismiss once
-    st.session_state.login_guide_step = 1
 
 if "dashboard_guide_step" not in st.session_state:
     st.session_state.dashboard_guide_step = 99 if st.session_state.get("guide_completed", False) else 1
@@ -748,12 +722,9 @@ if st.session_state.get("student_logged_in", False) and "saved_semesters" not in
 
 # --- STEP 0: LOGIN & PASSWORD AUTHENTICATION ---
 if not st.session_state.get("student_logged_in", False):
-    # Attempt silent auto-login from browser localStorage
-    attempt_browser_auto_login()
-
     st.title("Attendance, Timetable & Calendar Tracker")
     st.subheader("Student Login & Password Verification")
-    st.caption("Returning users are remembered automatically on their browser. First-time users: enter your details and set your password.")
+    st.caption("Keep 'Remember Me' ticked so restarting the app or reopening the browser logs you in automatically without asking again.")
 
     with st.form("student_login_form"):
         input_email = st.text_input("Enter Your Gmail Address (must end with @gmail.com):")
@@ -761,7 +732,7 @@ if not st.session_state.get("student_logged_in", False):
         input_name = st.text_input("Enter Your Real Full Name (Required for first-time registration):")
         input_branch = st.selectbox("Select Your Branch:", BRANCH_OPTIONS)
         input_batch = st.selectbox("Select Your College Batch:", BATCH_OPTIONS)
-        remember_me = st.checkbox("Remember Me automatically on this browser (Never ask me to login again)", value=True)
+        remember_me = st.checkbox("Remember Me automatically (Never ask me to login again)", value=True)
         submit_btn = st.form_submit_button("Login / Register & Enter Dashboard")
 
         if submit_btn:
@@ -781,14 +752,12 @@ if not st.session_state.get("student_logged_in", False):
                 if is_existing_user:
                     user_obj = all_db[clean_email]
                     stored_hash = user_obj.get("password_hash", "")
-                    # Verify password if already set; if legacy account had no password, set it now
                     if stored_hash and stored_hash != pw_hashed:
                         st.error("Incorrect password for this Gmail account. Please try again.")
                         st.stop()
                     final_name = clean_name if clean_name else user_obj.get("name", "Student")
                     final_branch = user_obj.get("branch", input_branch)
                     final_batch = user_obj.get("batch", input_batch)
-                    # Existing remembered user -> skip the step guide!
                     guide_done = True
                     st.session_state.dashboard_guide_step = 99
                 else:
@@ -799,7 +768,6 @@ if not st.session_state.get("student_logged_in", False):
                     final_name = clean_name
                     final_branch = input_branch
                     final_batch = input_batch
-                    # Brand new user -> show step guide once
                     guide_done = False
                     st.session_state.dashboard_guide_step = 1
 
@@ -833,10 +801,10 @@ if not st.session_state.get("student_logged_in", False):
                     st.query_params.clear()
                     st.query_params["email"] = clean_email
                     st.query_params["token"] = pw_hashed
-                    save_credentials_to_browser(clean_email, pw_hashed)
+                    save_local_remembered_session(clean_email, pw_hashed)
                 else:
                     st.query_params.clear()
-                    clear_credentials_from_browser()
+                    clear_local_remembered_session()
 
                 st.rerun()
 
@@ -845,10 +813,6 @@ if not st.session_state.get("student_logged_in", False):
         unsafe_allow_html=True,
     )
     st.stop()
-
-# Ensure browser localStorage stays synced when logged in with URL params
-if st.query_params.get("email") and st.query_params.get("token"):
-    save_credentials_to_browser(st.query_params["email"], st.query_params["token"])
 
 # --- MAIN DASHBOARD ---
 active_step = st.session_state.dashboard_guide_step
@@ -899,12 +863,10 @@ with t_col2:
 
 with t_col3:
     st.write("")
-    if st.button("Replay Feature Guide", disabled=guide_is_active, use_container_width=True):
+    if st.button("Replay Feature Guide", disabled=guide_is_active, width="stretch"):
         st.session_state.guide_completed = False
         st.session_state.dashboard_guide_step = 1
         st.rerun()
-
-target_ratio = target_att_pct / 100.0
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("Student Profile")
@@ -928,7 +890,7 @@ if new_selected_batch != st.session_state.get("student_batch"):
     st.rerun()
 
 if st.sidebar.button("Switch Student / Logout", disabled=guide_is_active):
-    clear_credentials_from_browser()
+    clear_local_remembered_session()
     st.query_params.clear()
     st.query_params["logged_out"] = "1"
     st.session_state.student_logged_in = False
@@ -1050,7 +1012,7 @@ with sec1_wrapper:
                 "Unattended": st.column_config.NumberColumn("Unattended Lectures (Missed)", min_value=0, default=0, step=1),
                 "Extra Lectures Attended": st.column_config.NumberColumn("Extra Lectures Attended", min_value=0, default=0, step=1),
             },
-            use_container_width=True,
+            width="stretch",
             key=f"sec1_editor_{selected_semester}",
         )
 
@@ -1220,7 +1182,7 @@ with sec3_wrapper:
                                 f'<div class="cal-cell {css_class}"><div>{day_num}</div><div class="cal-sub">{sub_label}</div></div>',
                                 unsafe_allow_html=True,
                             )
-                            if st.button("View", key=f"btn_{iso_str}", use_container_width=True, disabled=guide_is_active):
+                            if st.button("View", key=f"btn_{iso_str}", width="stretch", disabled=guide_is_active):
                                 st.session_state.selected_cal_date = cell_date
 
         with cal_col_right:
@@ -1246,12 +1208,11 @@ with sec3_wrapper:
 
                 saved_day_ticks = st.session_state.daily_slot_ticks.get(inspected_iso, {})
 
-                st.caption("Tick **Unattended (Missed)** beside any lecture/lab below (available for past and current dates). Ticking automatically updates your subject Unattended counts and calendar badge!")
+                st.caption("Tick **Unattended (Tick)** beside any lecture/lab below (available for past and current dates). Ticking automatically updates your subject Unattended counts and calendar badge!")
 
                 daily_rows = []
                 slot_subject_codes = []
                 for s_idx, (slot_label, raw_subj_entry) in enumerate(zip(TIME_SLOTS, day_slots)):
-                    # Filter multi-batch labs so ONLY the student's batch lab is shown and tracked
                     batch_filtered_entry, is_batch_lab = extract_batch_specific_entry(raw_subj_entry, batch_letter)
                     matched_sf = match_subject_short_form(batch_filtered_entry, subject_stats_by_short)
                     slot_subject_codes.append(matched_sf)
@@ -1287,11 +1248,10 @@ with sec3_wrapper:
                         "Unattended (Tick)": st.column_config.CheckboxColumn("Unattended (Tick)", default=False),
                     },
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                     key=f"daily_tick_editor_{inspected_iso}_{student_batch}",
                 )
 
-                # Sync tick changes with global subject Unattended counts and calendar badge
                 if not guide_is_active and not edited_daily_df["Unattended (Tick)"].equals(daily_df_editor_source["Unattended (Tick)"]):
                     new_ticks_for_day = {}
                     missed_short_forms_today = []
@@ -1312,7 +1272,6 @@ with sec3_wrapper:
                                 if matched_sf not in missed_short_forms_today:
                                     missed_short_forms_today.append(matched_sf)
 
-                            # Adjust Unattended count in main semester table by delta (+1 or -1)
                             if new_tick != old_tick:
                                 delta = 1 if new_tick else -1
                                 mask = sem_df_ref["Short Form"] == matched_sf
@@ -1324,7 +1283,6 @@ with sec3_wrapper:
                     st.session_state.daily_slot_ticks[inspected_iso] = new_ticks_for_day
                     st.session_state.saved_semesters[selected_semester] = sem_df_ref
 
-                    # Update Calendar yellow badge ('F' if all credit slots missed, or short-forms)
                     if ticked_credit_slots_today == 0:
                         st.session_state.daily_logs.pop(inspected_iso, None)
                     elif total_credit_slots_today > 0 and ticked_credit_slots_today >= total_credit_slots_today:
@@ -1343,10 +1301,9 @@ with sec3_wrapper:
                     )
                     st.rerun()
 
-                # Quick Full-Day Bunk / Clear buttons
                 q_col1, q_col2 = st.columns(2)
                 with q_col1:
-                    if st.button("Tick Full Day Bunk ('F')", key=f"full_bunk_{inspected_iso}", use_container_width=True, disabled=guide_is_active):
+                    if st.button("Tick Full Day Bunk ('F')", key=f"full_bunk_{inspected_iso}", width="stretch", disabled=guide_is_active):
                         sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
                         new_ticks_for_day = {}
                         for s_idx, matched_sf in enumerate(slot_subject_codes):
@@ -1374,7 +1331,7 @@ with sec3_wrapper:
                         st.rerun()
 
                 with q_col2:
-                    if st.button("Clear All Ticks (Attended All)", key=f"clear_bunk_{inspected_iso}", use_container_width=True, disabled=guide_is_active):
+                    if st.button("Clear All Ticks (Attended All)", key=f"clear_bunk_{inspected_iso}", width="stretch", disabled=guide_is_active):
                         sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
                         for s_idx, matched_sf in enumerate(slot_subject_codes):
                             old_tick = bool(saved_day_ticks.get(str(s_idx), False))
@@ -1399,10 +1356,10 @@ with sec3_wrapper:
 
         if selected_semester == "Semester I":
             with st.expander("Official FE Academic Calendar Milestones (Odd Semester AY 2026-27)", expanded=False):
-                st.dataframe(pd.DataFrame(SEM1_OFFICIAL_MILESTONES), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(SEM1_OFFICIAL_MILESTONES), hide_index=True, width="stretch")
         else:
             with st.expander(f"{selected_semester} & Full Yearly Holiday List (2026-27)", expanded=False):
-                st.dataframe(pd.DataFrame(YEARLY_HOLIDAYS), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(YEARLY_HOLIDAYS), hide_index=True, width="stretch")
 
     if s3_col_guide is not None:
         with s3_col_guide:
@@ -1480,7 +1437,7 @@ with sec4_wrapper:
                 "Required for Target": st.column_config.NumberColumn(f"Required for {target_att_pct}%"),
                 "Classes Needed for Target": st.column_config.NumberColumn(f"Classes Needed for {target_att_pct}%"),
             },
-            use_container_width=True,
+            width="stretch",
             key=f"sec4_editor_{selected_semester}_{target_att_pct}",
         )
 
@@ -1512,7 +1469,7 @@ with sec4_wrapper:
             st.info("Note: These calculations assume that you will attend all of your remaining upcoming lectures—so don't be a defaulter!")
             st.dataframe(
                 sec4_source_df.style.apply(style_attendance_row, axis=1).format({"Current Attendance %": "{:.2f}%"}),
-                use_container_width=True,
+                width="stretch",
             )
 
     if s4_col_guide is not None:
@@ -1545,10 +1502,6 @@ with sec5_wrapper:
     batch_letter = student_batch[-1].upper()
 
     def build_vertical_timetable_html(grid_dict):
-        """
-        Builds a large vertical HTML timetable where MON..FRI are columns and Time Slots are rows.
-        For multi-batch labs, filters out other batches and shows ONLY the chosen batch's lab and its specific attendance.
-        """
         days_order = ["MON", "TUE", "WED", "THR", "FRI"]
         html = '<table class="vertical-tt-table"><thead><tr>'
         html += '<th>TIME SLOT</th>'
@@ -1580,7 +1533,6 @@ with sec5_wrapper:
 
                 display_val = batch_entry
                 if is_batch_lab:
-                    # Removed 'BLINKING:' prefix as requested
                     display_val += f'<br><span class="blinking-batch-badge">YOUR {student_batch.upper()} LAB</span>'
 
                 html += f'<td class="{cell_class}">{display_val}{att_subtext}</td>'
@@ -1607,13 +1559,13 @@ with sec5_wrapper:
             if os.path.exists(TIMETABLE_IMG_PATH):
                 img_top_col1, img_top_col2 = st.columns([4, 1])
                 with img_top_col2:
-                    if st.button("Remove Timetable Image", type="secondary", use_container_width=True, disabled=guide_is_active):
+                    if st.button("Remove Timetable Image", type="secondary", width="stretch", disabled=guide_is_active):
                         try:
                             os.remove(TIMETABLE_IMG_PATH)
                         except Exception:
                             pass
                         st.rerun()
-                st.image(TIMETABLE_IMG_PATH, caption="Official First Year Engineering Timetable (Even & Odd Weeks)", use_container_width=True)
+                st.image(TIMETABLE_IMG_PATH, caption="Official First Year Engineering Timetable (Even & Odd Weeks)", width="stretch")
             else:
                 st.info("No timetable image is currently saved. You can either **Upload an image file** OR **Paste a copied image (`Ctrl + V`)** below.")
 
@@ -1631,7 +1583,6 @@ with sec5_wrapper:
 
             with up_col2:
                 st.write("**Option 2: Paste Copied Image Only (`Ctrl + V`)**")
-                # Interactive clipboard image paste zone converts pasted image to DataURL for instant saving
                 components.html(
                     """
                     <div id="paste-zone" tabindex="0" style="
@@ -1720,7 +1671,7 @@ if (
         if os.path.exists(VISITOR_LOG_FILE):
             log_df = pd.read_csv(VISITOR_LOG_FILE)
             log_df.index = range(1, len(log_df) + 1)
-            st.dataframe(log_df)
+            st.dataframe(log_df, width="stretch")
         else:
             st.write("No students have logged in yet.")
 
