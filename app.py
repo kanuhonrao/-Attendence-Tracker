@@ -2,17 +2,20 @@ import base64
 import calendar
 import datetime
 import hashlib
+import hmac
 import json
 import math
 import os
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import extra_streamlit_components as stx
 
 # Page Configuration
 st.set_page_config(
     page_title="Attendance & Interactive Calendar Tracker",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 VISITOR_LOG_FILE = "student_visitors_log.csv"
@@ -20,14 +23,49 @@ STUDENT_DB_FILE = "saved_students_compact.json"
 ADMIN_GLOBAL_EXTRAS_FILE = "admin_global_extras.json"
 TIMETABLE_IMG_PATH = "timetable.jpg"
 
+# SECURITY CLEANUP: Immediately delete the old shared server session file if it exists!
+if os.path.exists(".remembered_session.json"):
+    try:
+        os.remove(".remembered_session.json")
+    except Exception:
+        pass
+
 # Exclusive Admin Credentials
 ADMIN_EMAIL = "honraokanishka@gmail.com"
 ADMIN_PASSWORD_PLAIN = "G!nt0k1."
+COOKIE_SECRET_SALT = "DBIT_SECURE_SALT_2026_KMH"
 
 
-# --- HELPER FUNCTIONS ---
+# --- SECURITY & HELPER FUNCTIONS ---
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.strip().encode("utf-8")).hexdigest()
+
+
+def create_browser_auth_token(email: str, pw_hash: str) -> str:
+    """Creates a signed token tied to a specific email and password hash for the user's browser cookie."""
+    msg = f"{email.strip().lower()}:{pw_hash}".encode("utf-8")
+    sig = hmac.new(COOKIE_SECRET_SALT.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{email.strip().lower()}|{sig}"
+
+
+def verify_browser_auth_token(token_str: str, all_db: dict):
+    """Verifies a browser cookie token against the student database. Returns email if valid, else None."""
+    if not token_str or "|" not in str(token_str):
+        return None
+    try:
+        email, sig = str(token_str).split("|", 1)
+        email = email.strip().lower()
+        if email not in all_db:
+            return None
+        pw_hash = all_db[email].get("password_hash", "")
+        if not pw_hash:
+            return None
+        expected_token = create_browser_auth_token(email, pw_hash)
+        if hmac.compare_digest(str(token_str), expected_token):
+            return email
+    except Exception:
+        return None
+    return None
 
 
 def get_ist_now():
@@ -71,32 +109,6 @@ def save_admin_global_extras(extras_dict):
             json.dump(extras_dict, f)
     except Exception:
         pass
-
-
-def save_local_remembered_session(email: str, token: str):
-    try:
-        with open(".remembered_session.json", "w", encoding="utf-8") as f:
-            json.dump({"email": email.strip().lower(), "token": token}, f)
-    except Exception:
-        pass
-
-
-def load_local_remembered_session():
-    if os.path.exists(".remembered_session.json"):
-        try:
-            with open(".remembered_session.json", "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def clear_local_remembered_session():
-    if os.path.exists(".remembered_session.json"):
-        try:
-            os.remove(".remembered_session.json")
-        except Exception:
-            pass
 
 
 def save_student_compact(
@@ -186,6 +198,14 @@ def update_student_visit(email, name, branch, batch):
     log_df.to_csv(VISITOR_LOG_FILE, index=False)
 
 
+# --- INITIALIZE PER-BROWSER COOKIE MANAGER (ISOLATED PER DEVICE/PHONE) ---
+cookie_manager = stx.CookieManager(key="secure_student_cookie_mgr")
+
+# SECURITY FIX: Never allow ?email= or ?token= in the URL bar so shared WhatsApp links NEVER leak accounts!
+if "email" in st.query_params or "token" in st.query_params or "logged_out" in st.query_params:
+    st.query_params.clear()
+
+
 # --- CONTEXTUAL STEP GUIDE ---
 def apply_guide_blur_css():
     st.markdown(
@@ -201,13 +221,6 @@ def apply_guide_blur_css():
             filter: blur(8px) brightness(0.38);
             pointer-events: none !important;
             user-select: none !important;
-        }
-        .locked-linked-preview {
-            pointer-events: none !important;
-            user-select: none !important;
-            border: 2px dashed #3b82f6;
-            border-radius: 10px;
-            padding: 8px;
         }
         </style>
         """,
@@ -270,7 +283,7 @@ def render_side_guide_card(step_num, total_steps, title, message, state_key, arr
     )
 
 
-# --- GLOBAL CSS ---
+# --- GLOBAL & MOBILE-RESPONSIVE CSS ---
 st.markdown(
     """
     <style>
@@ -322,7 +335,7 @@ st.markdown(
         padding: 14px 20px;
         border: 2px solid #38bdf8;
         border-radius: 8px;
-        font-size: 22px;
+        font-size: 20px;
         font-weight: 900;
         letter-spacing: 1px;
         text-transform: uppercase;
@@ -338,10 +351,10 @@ st.markdown(
     .blinking-batch-badge {
         background-color: #dc2626;
         color: #ffffff;
-        padding: 3px 8px;
+        padding: 3px 7px;
         border-radius: 5px;
         font-weight: 800;
-        font-size: 11.5px;
+        font-size: 11px;
         border: 1px solid #fecaca;
         animation: blinker 1s linear infinite;
         display: inline-block;
@@ -384,32 +397,32 @@ st.markdown(
         margin-bottom: 8px;
     }
     .cal-legend {
-        display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 12px;
+        display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
         padding: 10px; background: rgba(30, 41, 59, 0.7); border: 1px solid #475569; border-radius: 8px;
     }
-    .legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
-    .dot-red { width: 14px; height: 14px; background: #ef4444; border-radius: 3px; display: inline-block; }
-    .dot-green { width: 14px; height: 14px; background: #22c55e; border-radius: 3px; display: inline-block; }
-    .dot-yellow { width: 14px; height: 14px; background: #eab308; border-radius: 3px; display: inline-block; }
-    .dot-blue { width: 14px; height: 14px; background: #3b82f6; border-radius: 3px; display: inline-block; }
+    .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; }
+    .dot-red { width: 13px; height: 13px; background: #ef4444; border-radius: 3px; display: inline-block; }
+    .dot-green { width: 13px; height: 13px; background: #22c55e; border-radius: 3px; display: inline-block; }
+    .dot-yellow { width: 13px; height: 13px; background: #eab308; border-radius: 3px; display: inline-block; }
+    .dot-blue { width: 13px; height: 13px; background: #3b82f6; border-radius: 3px; display: inline-block; }
 
     .cal-hdr-cell {
         text-align: center;
         font-weight: 800;
-        font-size: 13px;
+        font-size: 12.5px;
         color: #f8fafc;
         background-color: #1e293b;
         border: 1.5px solid #64748b;
-        padding: 8px 4px;
+        padding: 7px 2px;
         margin-bottom: 2px;
     }
     .cal-cell {
         border-radius: 0px;
-        padding: 8px 4px;
+        padding: 6px 2px;
         text-align: center;
         font-weight: 700;
-        font-size: 13px;
-        min-height: 58px;
+        font-size: 12.5px;
+        min-height: 52px;
         display: flex;
         flex-direction: column;
         justify-content: center;
@@ -423,42 +436,49 @@ st.markdown(
     .cal-blue { background-color: #3b82f6; color: #ffffff; border: 1.5px solid #1e40af; }
     .cal-empty {
         background-color: rgba(15, 23, 42, 0.35);
-        min-height: 58px;
+        min-height: 52px;
         border: 1.5px solid #334155;
         box-sizing: border-box;
     }
-    .cal-sub { font-size: 10px; font-weight: 800; margin-top: 3px; line-height: 1.1; }
+    .cal-sub { font-size: 9px; font-weight: 800; margin-top: 2px; line-height: 1.05; word-break: break-word; }
 
+    .tt-scroll-wrapper {
+        width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        border-radius: 8px;
+        margin-top: 8px;
+    }
     .vertical-tt-table {
         width: 100%;
+        min-width: 680px;
         border-collapse: collapse;
-        margin-top: 10px;
         font-family: 'Segoe UI', sans-serif;
     }
     .vertical-tt-table th {
         background-color: #1e293b;
         color: #f8fafc;
-        font-size: 16px;
+        font-size: 15px;
         font-weight: 800;
-        padding: 14px 12px;
+        padding: 12px 10px;
         border: 2px solid #475569;
         text-align: center;
     }
     .vertical-tt-table td {
-        padding: 16px 12px;
+        padding: 14px 10px;
         border: 2px solid #475569;
         text-align: center;
         vertical-align: middle;
-        font-size: 14.5px;
-        line-height: 1.45;
-        min-height: 74px;
+        font-size: 13.5px;
+        line-height: 1.4;
+        min-height: 68px;
     }
     .tt-slot-col {
         background-color: #0f172a;
         color: #e2e8f0;
         font-weight: 800;
-        font-size: 14px;
-        width: 15%;
+        font-size: 13px;
+        width: 14%;
     }
     .tt-cell-green {
         background-color: rgba(34, 197, 94, 0.28);
@@ -487,9 +507,59 @@ st.markdown(
         padding: 18px;
         border-top: 2px solid #334155;
         color: #e2e8f0;
-        font-size: 18px;
+        font-size: 17px;
         font-weight: 700;
         letter-spacing: 0.5px;
+    }
+
+    /* --- MOBILE SCREEN OPTIMIZATIONS (ANDROID & IOS) --- */
+    @media (max-width: 768px) {
+        .block-container {
+            padding-left: 0.6rem !important;
+            padding-right: 0.6rem !important;
+            padding-top: 1.2rem !important;
+        }
+        h1 { font-size: 1.55rem !important; }
+        h2, h3 { font-size: 1.2rem !important; }
+        .missed-lectures-banner {
+            font-size: 15px !important;
+            padding: 10px 12px !important;
+        }
+        /* Keep the 7-column calendar grid in a real 7-column row on mobile phones instead of stacking! */
+        [data-testid="stHorizontalBlock"]:has(.cal-cell),
+        [data-testid="stHorizontalBlock"]:has(.cal-empty),
+        [data-testid="stHorizontalBlock"]:has(.cal-hdr-cell) {
+            display: grid !important;
+            grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+            gap: 2px !important;
+            width: 100% !important;
+        }
+        [data-testid="stHorizontalBlock"]:has(.cal-cell) > div,
+        [data-testid="stHorizontalBlock"]:has(.cal-empty) > div,
+        [data-testid="stHorizontalBlock"]:has(.cal-hdr-cell) > div {
+            width: 100% !important;
+            min-width: 0 !important;
+            flex: unset !important;
+        }
+        .cal-hdr-cell {
+            font-size: 10px !important;
+            padding: 4px 1px !important;
+        }
+        .cal-cell, .cal-empty {
+            min-height: 44px !important;
+            font-size: 11px !important;
+            padding: 3px 1px !important;
+        }
+        .cal-sub {
+            font-size: 7.5px !important;
+        }
+        /* Make 'View' buttons under calendar cells compact on mobile */
+        [data-testid="stHorizontalBlock"]:has(.cal-cell) button {
+            padding: 2px 2px !important;
+            font-size: 9.5px !important;
+            min-height: 24px !important;
+            height: 24px !important;
+        }
     }
     </style>
     """,
@@ -563,17 +633,14 @@ def extract_batch_specific_entry(raw_entry: str, batch_letter: str):
 
 
 def match_subject_short_form(entry_text: str, subject_stats_dict: dict):
-    """Matches either a Short Form (e.g., 'CP', 'FEM-I') OR a Course Code (e.g., '25FE1VSEC02')."""
     clean_up = entry_text.strip().upper()
     if not clean_up:
         return None
     if "WORKSHOP" in clean_up or "WS-I" in clean_up:
         return "WS-I" if "WS-I" in subject_stats_dict else None
-    # Check exact or substring match for Course Code first
     for sf_code, info in subject_stats_dict.items():
         if info["code"].upper() in clean_up:
             return sf_code
-    # Then check Short Form (longest first so FEM-I matches before EM)
     for sf_code in sorted(subject_stats_dict.keys(), key=len, reverse=True):
         if sf_code.upper() in clean_up:
             return sf_code
@@ -702,37 +769,25 @@ def hydrate_semesters_for_user(user_obj):
     return sem_dict_out
 
 
-# --- AUTO-LOGIN ---
-query_params = st.query_params
-saved_email = query_params.get("email", "").strip().lower()
-saved_token = query_params.get("token", "").strip()
-local_rem = load_local_remembered_session()
-
+# --- PER-DEVICE BROWSER COOKIE AUTO-LOGIN (100% ISOLATED PER USER PHONE/PC) ---
 if "student_logged_in" not in st.session_state:
-    all_db = load_all_students_db()
-    if not saved_email and local_rem and not query_params.get("logged_out"):
-        saved_email = local_rem.get("email", "").strip().lower()
-        saved_token = local_rem.get("token", "").strip()
+    st.session_state.student_logged_in = False
 
-    if saved_email and saved_email in all_db:
-        user_record = all_db[saved_email]
-        stored_pw_hash = user_record.get("password_hash", "")
-        if (stored_pw_hash and saved_token == stored_pw_hash) or (not stored_pw_hash):
+if not st.session_state.get("student_logged_in", False) and not st.session_state.get("manual_logout", False):
+    browser_cookie_token = cookie_manager.get(cookie="att_device_auth_token")
+    if browser_cookie_token:
+        all_db = load_all_students_db()
+        verified_email = verify_browser_auth_token(browser_cookie_token, all_db)
+        if verified_email:
+            user_record = all_db[verified_email]
             st.session_state.student_logged_in = True
-            st.session_state.student_email = user_record.get("email", saved_email)
+            st.session_state.student_email = verified_email
             st.session_state.student_name = user_record.get("name", "Student")
             st.session_state.student_branch = user_record.get("branch", BRANCH_OPTIONS[0])
             st.session_state.student_batch = user_record.get("batch", BATCH_OPTIONS[0])
             st.session_state.guide_completed = True
             st.session_state.target_attendance_pct = int(user_record.get("target_attendance_pct", 75))
             st.session_state.dashboard_guide_step = 99
-            st.query_params["email"] = saved_email
-            if stored_pw_hash:
-                st.query_params["token"] = stored_pw_hash
-        else:
-            st.session_state.student_logged_in = False
-    else:
-        st.session_state.student_logged_in = False
 
 if "dashboard_guide_step" not in st.session_state:
     st.session_state.dashboard_guide_step = 99 if st.session_state.get("guide_completed", False) else 1
@@ -752,17 +807,17 @@ if st.session_state.get("student_logged_in", False) and "saved_semesters" not in
 # --- LOGIN SCREEN ---
 if not st.session_state.get("student_logged_in", False):
     st.title("Attendance, Timetable & Calendar Tracker")
-    st.subheader("Student Login & Password Verification")
-    st.caption("Keep 'Remember Me' ticked so restarting the app or reopening the browser logs you in automatically.")
+    st.subheader("Secure Student Login & Registration")
+    st.caption("Your login is saved privately inside your own phone/laptop browser cookie—sharing the website link in groups will never share your account.")
 
     with st.form("student_login_form"):
         input_email = st.text_input("Enter Your Gmail Address (must end with @gmail.com):")
-        input_password = st.text_input("Enter Your Password:", type="password")
+        input_password = st.text_input("Enter Your Password (new users: choose a password to lock your account):", type="password")
         input_name = st.text_input("Enter Your Real Full Name (Required for first-time registration):")
         input_branch = st.selectbox("Select Your Branch:", BRANCH_OPTIONS)
         input_batch = st.selectbox("Select Your College Batch:", BATCH_OPTIONS)
-        remember_me = st.checkbox("Remember Me automatically", value=True)
-        submit_btn = st.form_submit_button("Login / Register & Enter Dashboard")
+        remember_me = st.checkbox("Remember Me on this device only", value=True)
+        submit_btn = st.form_submit_button("Login / Register & Enter Dashboard", width="stretch")
 
         if submit_btn:
             clean_email = input_email.strip().lower()
@@ -774,7 +829,6 @@ if not st.session_state.get("student_logged_in", False):
             elif not clean_pw:
                 st.error("Please enter a password.")
             else:
-                # If logging in as Admin Gmail, enforce the Admin Password ("G!nt0k1.")
                 if clean_email == ADMIN_EMAIL.lower() and clean_pw != ADMIN_PASSWORD_PLAIN:
                     st.error("Invalid password for Admin Gmail account.")
                     st.stop()
@@ -805,6 +859,7 @@ if not st.session_state.get("student_logged_in", False):
                     guide_done = False
                     st.session_state.dashboard_guide_step = 1
 
+                st.session_state.manual_logout = False
                 st.session_state.student_email = clean_email
                 st.session_state.student_name = final_name
                 st.session_state.student_branch = final_branch
@@ -834,13 +889,17 @@ if not st.session_state.get("student_logged_in", False):
                 update_student_visit(clean_email, final_name, final_branch, final_batch)
 
                 if remember_me:
-                    st.query_params.clear()
-                    st.query_params["email"] = clean_email
-                    st.query_params["token"] = pw_hashed
-                    save_local_remembered_session(clean_email, pw_hashed)
+                    signed_token = create_browser_auth_token(clean_email, pw_hashed)
+                    cookie_manager.set(
+                        "att_device_auth_token",
+                        signed_token,
+                        expires_at=datetime.datetime.now() + datetime.timedelta(days=60),
+                    )
                 else:
-                    st.query_params.clear()
-                    clear_local_remembered_session()
+                    try:
+                        cookie_manager.delete("att_device_auth_token")
+                    except Exception:
+                        pass
 
                 st.rerun()
 
@@ -849,9 +908,6 @@ if not st.session_state.get("student_logged_in", False):
         unsafe_allow_html=True,
     )
     st.stop()
-
-if st.query_params.get("email") and st.query_params.get("token"):
-    save_local_remembered_session(st.query_params["email"], st.query_params["token"])
 
 if "slot7_extra_map" not in st.session_state:
     st.session_state.slot7_extra_map = {}
@@ -865,6 +921,45 @@ if guide_is_active:
 greeting = get_time_greeting()
 st.title(f"{greeting}, {st.session_state.student_name}")
 st.caption(f"**Branch:** {st.session_state.student_branch} | **Batch:** {st.session_state.get('student_batch', 'Batch A')} | **Verified Gmail:** {st.session_state.student_email}")
+
+# Quick Mobile Bar for Batch, Semester & Logout (so mobile users don't even need to open the sidebar!)
+with st.expander("Quick Profile, Batch, Semester & Logout Controls (Mobile Friendly)", expanded=False):
+    mob_c1, mob_c2, mob_c3 = st.columns(3)
+    with mob_c1:
+        current_batch_idx = BATCH_OPTIONS.index(st.session_state.get("student_batch", BATCH_OPTIONS[0])) if st.session_state.get("student_batch") in BATCH_OPTIONS else 0
+        quick_batch = st.selectbox("Your Batch:", BATCH_OPTIONS, index=current_batch_idx, key="mob_batch_sel", disabled=guide_is_active)
+        if quick_batch != st.session_state.get("student_batch"):
+            st.session_state.student_batch = quick_batch
+            save_student_compact(
+                st.session_state.student_email,
+                st.session_state.student_name,
+                st.session_state.student_branch,
+                st.session_state.student_batch,
+                st.session_state.saved_semesters,
+                st.session_state.daily_logs,
+                st.session_state.daily_slot_ticks,
+                st.session_state.slot7_extra_map,
+            )
+            st.rerun()
+    with mob_c2:
+        selected_semester = st.selectbox(
+            "Choose Semester (1 to 8):",
+            list(SEMESTER_DATA.keys()),
+            index=0,
+            key="mob_sem_sel",
+            disabled=guide_is_active,
+        )
+    with mob_c3:
+        st.write("")
+        if st.button("Logout of This Device", key="mob_logout_btn", width="stretch", disabled=guide_is_active):
+            try:
+                cookie_manager.delete("att_device_auth_token")
+            except Exception:
+                pass
+            st.session_state.manual_logout = True
+            st.session_state.student_logged_in = False
+            st.session_state.pop("saved_semesters", None)
+            st.rerun()
 
 # --- TOP BAR: DESIRED ATTENDANCE PERCENTAGE ---
 st.markdown("### Custom Target Attendance Percentage")
@@ -916,22 +1011,7 @@ st.sidebar.header("Student Profile")
 st.sidebar.write(f"**Name:** {st.session_state.student_name}")
 st.sidebar.write(f"**Email:** {st.session_state.student_email}")
 st.sidebar.write(f"**Branch:** {st.session_state.student_branch}")
-
-current_batch_idx = BATCH_OPTIONS.index(st.session_state.get("student_batch", BATCH_OPTIONS[0])) if st.session_state.get("student_batch") in BATCH_OPTIONS else 0
-new_selected_batch = st.sidebar.selectbox("College Batch:", BATCH_OPTIONS, index=current_batch_idx, disabled=guide_is_active)
-if new_selected_batch != st.session_state.get("student_batch"):
-    st.session_state.student_batch = new_selected_batch
-    save_student_compact(
-        st.session_state.student_email,
-        st.session_state.student_name,
-        st.session_state.student_branch,
-        st.session_state.student_batch,
-        st.session_state.saved_semesters,
-        st.session_state.daily_logs,
-        st.session_state.daily_slot_ticks,
-        st.session_state.slot7_extra_map,
-    )
-    st.rerun()
+st.sidebar.write(f"**Batch:** {st.session_state.get('student_batch', 'Batch A')}")
 
 # --- ADMIN POWER PANEL (EXCLUSIVELY FOR KANISHKA WITH PASSWORD "G!nt0k1.") ---
 is_kanishka = st.session_state.student_email.strip().lower() == ADMIN_EMAIL.strip().lower()
@@ -976,22 +1056,16 @@ if is_kanishka:
         st.sidebar.error("Incorrect Admin Password.")
 
 if st.sidebar.button("Switch Student / Logout", disabled=guide_is_active):
-    clear_local_remembered_session()
-    st.query_params.clear()
-    st.query_params["logged_out"] = "1"
+    try:
+        cookie_manager.delete("att_device_auth_token")
+    except Exception:
+        pass
+    st.session_state.manual_logout = True
     st.session_state.student_logged_in = False
     st.session_state.pop("saved_semesters", None)
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.header("Select Semester")
-selected_semester = st.sidebar.selectbox(
-    "Choose Semester (1 to 8):",
-    list(SEMESTER_DATA.keys()),
-    index=0,
-    disabled=guide_is_active,
-)
-
 if st.sidebar.button(f"Reset {selected_semester} Missed Lectures to 0", disabled=guide_is_active):
     reset_df = pd.DataFrame(SEMESTER_DATA[selected_semester])
     reset_df.index = range(1, len(reset_df) + 1)
@@ -1033,7 +1107,7 @@ target_credits = st.sidebar.number_input(
 )
 
 
-# --- HELPER TO COMPUTE DERIVED COLUMNS (INCLUDING ADMIN BROADCAST FOR NON-ADMIN STUDENTS) ---
+# --- HELPER TO COMPUTE DERIVED COLUMNS ---
 def compute_attendance_metrics(base_df, target_pct_val: int, current_user_email: str):
     t_ratio = target_pct_val / 100.0
     is_admin_user = current_user_email.strip().lower() == ADMIN_EMAIL.strip().lower()
@@ -1052,7 +1126,6 @@ def compute_attendance_metrics(base_df, target_pct_val: int, current_user_email:
         df["Extra Lectures Attended"] = 0
     df["Extra Lectures Attended"] = pd.to_numeric(df["Extra Lectures Attended"], errors="coerce").fillna(0).clip(lower=0).astype(int)
 
-    # Admin Broadcasted Extra Lectures: Visible ONLY to everyone else OTHER than Admin (Kanishka)
     if not is_admin_user:
         df["Admin Broadcast Extra"] = df["Course Code"].apply(lambda c: int(global_extras.get(c, 0)))
     else:
@@ -1087,7 +1160,7 @@ with sec1_wrapper:
         '<div class="missed-lectures-banner">ENTER HOW MANY LECTURES YOU HAVE MISSED</div>',
         unsafe_allow_html=True,
     )
-    st.caption("Double-click **Unattended** (missed lectures, default 0), **Extra Lectures Attended**, or **Importance (1-3)** to update. Synced with Section 3 Calendar Ticks and Section 4.")
+    st.caption("Tap or double-click **Unattended** (missed lectures, default 0), **Extra Lectures Attended**, or **Importance (1-3)** to update. Synced with Section 3 Calendar Ticks and Section 4.")
 
     if guide_is_active and active_step == 1:
         s1_col_main, s1_col_guide = st.columns([2.2, 1])
@@ -1145,7 +1218,6 @@ df = compute_attendance_metrics(
     st.session_state.student_email,
 )
 
-# Show banner for non-admin students if Admin broadcasted global extra lectures
 if not is_kanishka and int(df["Admin Broadcast Extra"].sum()) > 0:
     st.info(f"Admin Broadcast Active: {int(df['Admin Broadcast Extra'].sum())} extra college-wide lecture(s) have been automatically included in your attendance calculation.")
 
@@ -1173,7 +1245,7 @@ with sec2_wrapper:
         st.markdown('<div class="blur-target-block"></div>', unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader(f"2. {selected_semester} {target_att_pct}% Target Summary (Based on Unattended & Extra Lectures)")
+    st.subheader(f"2. {selected_semester} {target_att_pct}% Target Summary")
 
     overall_att = (df["Effective Attended"].sum() / df["Total Lectures"].sum()) * 100
     total_unattended = int(df["Unattended"].sum())
@@ -1181,12 +1253,12 @@ with sec2_wrapper:
     total_classes_needed = int(df["Classes Needed for Target"].sum())
 
     mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-    mcol1.metric("Overall Attendance (with Extra)", f"{overall_att:.2f}%", delta=f"Safe (>={target_att_pct}%)" if overall_att >= target_att_pct else f"Below {target_att_pct}%", delta_color="normal" if overall_att >= target_att_pct else "inverse")
-    mcol2.metric("Total Unattended Lectures (Detected)", f"{total_unattended} missed")
-    mcol3.metric(f"Safe Bunks Left (for {target_att_pct}%)", f"{total_safe_bunks} bunks left")
-    mcol4.metric(f"Classes Needed for {target_att_pct}%", f"{total_classes_needed} classes")
+    mcol1.metric("Overall Attendance", f"{overall_att:.2f}%", delta=f"Safe (>={target_att_pct}%)" if overall_att >= target_att_pct else f"Below {target_att_pct}%", delta_color="normal" if overall_att >= target_att_pct else "inverse")
+    mcol2.metric("Total Unattended", f"{total_unattended} missed")
+    mcol3.metric(f"Safe Bunks ({target_att_pct}%)", f"{total_safe_bunks} left")
+    mcol4.metric(f"Needed for {target_att_pct}%", f"{total_classes_needed} classes")
 
-# --- SECTION 3: TABLE-BORDERED COMPACT CALENDAR & DAY CLICK INSPECTOR ---
+# --- SECTION 3: COMPACT MOBILE-FRIENDLY CALENDAR & DAY INSPECTOR ---
 sec3_wrapper = st.container()
 with sec3_wrapper:
     if guide_is_active and active_step in [1, 3, 4]:
@@ -1209,10 +1281,10 @@ with sec3_wrapper:
         st.markdown(
             """
             <div class="cal-legend">
-                <div class="legend-item"><span class="dot-red"></span> Red: Holiday & Weekends (Sat/Sun)</div>
-                <div class="legend-item"><span class="dot-green"></span> Green: Past Day (All Attended / 0 Missed)</div>
-                <div class="legend-item"><span class="dot-yellow"></span> Yellow: Past Unattended ('F' = Full Bunk / Short-Form = Missed Lectures)</div>
-                <div class="legend-item"><span class="dot-blue"></span> Blue: Normal Working Day</div>
+                <div class="legend-item"><span class="dot-red"></span> Red: Holiday & Weekends</div>
+                <div class="legend-item"><span class="dot-green"></span> Green: Past Attended</div>
+                <div class="legend-item"><span class="dot-yellow"></span> Yellow: Past Unattended ('F' / Short-Form)</div>
+                <div class="legend-item"><span class="dot-blue"></span> Blue: Working Day</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1263,7 +1335,7 @@ with sec3_wrapper:
 
                         if is_holiday:
                             css_class = "cal-red"
-                            sub_label = "HOLIDAY"
+                            sub_label = "HOL"
                         elif is_weekend:
                             css_class = "cal-red"
                             sub_label = "WKND"
@@ -1274,7 +1346,7 @@ with sec3_wrapper:
                                 sub_label = bunk_val
                             else:
                                 css_class = "cal-green"
-                                sub_label = "ATTENDED"
+                                sub_label = "ATT"
                         else:
                             bunk_val = st.session_state.daily_logs.get(iso_str, "")
                             if bunk_val:
@@ -1317,11 +1389,10 @@ with sec3_wrapper:
                 saved_slot7_sf = st.session_state.slot7_extra_map.get(inspected_iso, "")
 
                 st.caption(
-                    "**Slots 1 to 6 (9:00 AM – 4:00 PM) are non-editable.** Joined bulk lectures (like CP 3–4 or 2-hour Labs) are merged into **1 single unit**. "
+                    "**Slots 1 to 6 (9:00 AM – 4:00 PM) are locked.** Joined bulk lectures (like CP 3–4 or 2-hour Labs) are merged into **1 single unit**. "
                     "**Only the 4:00 PM – 5:00 PM slot is editable** for Extra Lectures!"
                 )
 
-                # Extract slots and merge continuous identical subjects (e.g., CP slots 3 & 4) into ONE single bulk lecture
                 raw_extracted_slots = []
                 for s_idx, (slot_label, raw_subj_entry) in enumerate(zip(TIME_SLOTS, day_slots)):
                     if s_idx == 8 and saved_slot7_sf:
@@ -1337,7 +1408,6 @@ with sec3_wrapper:
                 i = 0
                 while i < len(raw_extracted_slots):
                     s_idx, slot_label, entry_text, m_sf, is_lab = raw_extracted_slots[i]
-                    # Merge consecutive identical subject slots (excluding breaks and slot 7) into 1 single bulk lecture unit
                     if (
                         m_sf
                         and s_idx < 8
@@ -1395,7 +1465,6 @@ with sec3_wrapper:
 
                 daily_df_editor_source = pd.DataFrame(daily_rows)
 
-                # Lock ALL text columns in the table so 9 AM - 4 PM slots CANNOT be edited; only Unattended (Tick) is clickable here
                 edited_daily_df = st.data_editor(
                     daily_df_editor_source,
                     num_rows="fixed",
@@ -1410,7 +1479,6 @@ with sec3_wrapper:
                     key=f"daily_tick_editor_{inspected_iso}_{student_batch}",
                 )
 
-                # Dedicated Editable 4:00 PM - 5:00 PM Slot Input (ONLY Slot 7 is editable!)
                 st.markdown("##### Edit 4:00 PM – 5:00 PM Slot Only (Auto-Counts as Extra Lecture)")
                 slot7_col1, slot7_col2 = st.columns([2.2, 1])
                 with slot7_col1:
@@ -1437,14 +1505,12 @@ with sec3_wrapper:
                     if typed_slot7_code.strip() and not new_matched_sf:
                         st.error("Unrecognized subject code/short-form. Use FEM-I, AP, EC, EG, BE&DE, WS-I, CP, or UHV (or exact course code).")
                     else:
-                        # Remove previous extra lecture if one was already logged on this date's 4-5 PM slot
                         if saved_slot7_sf and saved_slot7_sf != new_matched_sf:
                             old_mask = sem_df_ref["Short Form"] == saved_slot7_sf
                             for r_i_sem in sem_df_ref[old_mask].index:
                                 curr_ex = int(sem_df_ref.loc[r_i_sem, "Extra Lectures Attended"])
                                 sem_df_ref.loc[r_i_sem, "Extra Lectures Attended"] = max(0, curr_ex - 1)
 
-                        # Add +1 Extra Lecture Attended if a new valid subject was entered
                         if new_matched_sf and new_matched_sf != saved_slot7_sf:
                             new_mask = sem_df_ref["Short Form"] == new_matched_sf
                             for r_i_sem in sem_df_ref[new_mask].index:
@@ -1469,7 +1535,6 @@ with sec3_wrapper:
                         )
                         st.rerun()
 
-                # Sync Unattended Ticks (Bulk blocks count as 1 single lecture unit!)
                 if not guide_is_active and not edited_daily_df["Unattended (Tick)"].equals(daily_df_editor_source["Unattended (Tick)"]):
                     sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
                     new_ticks_for_day = saved_day_ticks.copy()
@@ -1491,7 +1556,6 @@ with sec3_wrapper:
                                 if matched_sf not in missed_short_forms_today:
                                     missed_short_forms_today.append(matched_sf)
 
-                            # Even if g_inds has 2 slots (like CP 3 & 4), delta is strictly +1 or -1 (1 single bulk lecture!)
                             if new_tick != old_tick:
                                 delta = 1 if new_tick else -1
                                 mask = sem_df_ref["Short Form"] == matched_sf
@@ -1537,7 +1601,6 @@ with sec3_wrapper:
                                     for r_i_sem in sem_df_ref[mask].index:
                                         curr_u = int(sem_df_ref.loc[r_i_sem, "Unattended"])
                                         max_t = int(sem_df_ref.loc[r_i_sem, "Total Lectures"])
-                                        # Adds +1 per merged bulk unit
                                         sem_df_ref.loc[r_i_sem, "Unattended"] = min(max_t, curr_u + 1)
                         st.session_state.daily_slot_ticks[inspected_iso] = new_ticks_for_day
                         st.session_state.daily_logs[inspected_iso] = "F"
@@ -1712,7 +1775,7 @@ with sec4_wrapper:
                 arrow_dir="left",
             )
 
-# --- SECTION 5: VERTICAL LARGE TIMETABLE (MERGED BULK CELLS WITH ROWSPAN + BATCH-SPECIFIC LAB ATTENDANCE) ---
+# --- SECTION 5: VERTICAL LARGE TIMETABLE (MERGED BULK CELLS WITH ROWSPAN + MOBILE SCROLL) ---
 sec5_wrapper = st.container()
 with sec5_wrapper:
     if guide_is_active and active_step in [1, 2, 3]:
@@ -1731,14 +1794,9 @@ with sec5_wrapper:
     batch_letter = student_batch[-1].upper()
 
     def build_vertical_timetable_html(grid_dict):
-        """
-        Builds a vertical HTML timetable where MON..FRI are columns, and continuous multi-hour bulk blocks
-        (like Wednesday CP slots 3-4 or 2-hour Labs/Workshops) are merged into ONE single big cell using rowspan!
-        """
         days_order = ["MON", "TUE", "WED", "THR", "FRI"]
         num_slots = len(TIME_SLOTS)
 
-        # Precompute rowspan matrix so continuous duplicate slots in the same day merge into 1 big cell
         skip_cell = {d: [False] * num_slots for d in days_order}
         rowspan_map = {d: [1] * num_slots for d in days_order}
 
@@ -1766,7 +1824,7 @@ with sec5_wrapper:
                 else:
                     s_i += 1
 
-        html = '<table class="vertical-tt-table"><thead><tr>'
+        html = '<div class="tt-scroll-wrapper"><table class="vertical-tt-table"><thead><tr>'
         html += '<th>TIME SLOT</th>'
         for d_col in days_order:
             html += f'<th>{d_col}</th>'
@@ -1807,7 +1865,7 @@ with sec5_wrapper:
                 span_attr = f' rowspan="{r_span}"' if r_span > 1 else ""
                 html += f'<td class="{cell_class}"{span_attr}>{display_val}{att_subtext}</td>'
             html += '</tr>'
-        html += '</tbody></table>'
+        html += '</tbody></table></div>'
         return html
 
     with s5_col_main:
@@ -1818,11 +1876,11 @@ with sec5_wrapper:
         ])
 
         with tt_tab1:
-            st.caption(f"**Even Week Effective Dates:** 21–25 Sept | 5–9 Oct | 26–30 Oct | 9–13 Nov | 23–27 Nov 2026 (Bulk Lectures Merged | Showing Lab Attendance for **{student_batch}** | Target: {target_att_pct}%)")
+            st.caption(f"**Even Week Effective Dates:** 21–25 Sept | 5–9 Oct | 26–30 Oct | 9–13 Nov | 23–27 Nov 2026 (Swipe left/right on mobile | Batch: **{student_batch}** | Target: {target_att_pct}%)")
             st.markdown(build_vertical_timetable_html(EVEN_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
 
         with tt_tab2:
-            st.caption(f"**Odd Week Effective Dates:** 7–11 Sept | 28 Sept–2 Oct | 12–16 Oct | 1–6 Nov | 16–20 Nov | 30 Nov–4 Dec 2026 (Bulk Lectures Merged | Showing Lab Attendance for **{student_batch}** | Target: {target_att_pct}%)")
+            st.caption(f"**Odd Week Effective Dates:** 7–11 Sept | 28 Sept–2 Oct | 12–16 Oct | 1–6 Nov | 16–20 Nov | 30 Nov–4 Dec 2026 (Swipe left/right on mobile | Batch: **{student_batch}** | Target: {target_att_pct}%)")
             st.markdown(build_vertical_timetable_html(ODD_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
 
         with tt_tab3:
