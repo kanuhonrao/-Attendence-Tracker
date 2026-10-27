@@ -17,11 +17,12 @@ st.set_page_config(
 
 VISITOR_LOG_FILE = "student_visitors_log.csv"
 STUDENT_DB_FILE = "saved_students_compact.json"
-REMEMBER_ME_FILE = ".remembered_session.json"
+ADMIN_GLOBAL_EXTRAS_FILE = "admin_global_extras.json"
 TIMETABLE_IMG_PATH = "timetable.jpg"
 
-# Exclusive Admin Email (Admin log is ONLY visible when logged in with this email + password)
+# Exclusive Admin Credentials
 ADMIN_EMAIL = "honraokanishka@gmail.com"
+ADMIN_PASSWORD_PLAIN = "G!nt0k1."
 
 
 # --- HELPER FUNCTIONS ---
@@ -54,19 +55,36 @@ def load_all_students_db():
     return {}
 
 
-def save_local_remembered_session(email: str, token: str):
-    """Saves login session to disk so restarting `streamlit run app.py` never asks to login again."""
+def load_admin_global_extras():
+    if os.path.exists(ADMIN_GLOBAL_EXTRAS_FILE):
+        try:
+            with open(ADMIN_GLOBAL_EXTRAS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_admin_global_extras(extras_dict):
     try:
-        with open(REMEMBER_ME_FILE, "w", encoding="utf-8") as f:
+        with open(ADMIN_GLOBAL_EXTRAS_FILE, "w", encoding="utf-8") as f:
+            json.dump(extras_dict, f)
+    except Exception:
+        pass
+
+
+def save_local_remembered_session(email: str, token: str):
+    try:
+        with open(".remembered_session.json", "w", encoding="utf-8") as f:
             json.dump({"email": email.strip().lower(), "token": token}, f)
     except Exception:
         pass
 
 
 def load_local_remembered_session():
-    if os.path.exists(REMEMBER_ME_FILE):
+    if os.path.exists(".remembered_session.json"):
         try:
-            with open(REMEMBER_ME_FILE, "r", encoding="utf-8") as f:
+            with open(".remembered_session.json", "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return None
@@ -74,9 +92,9 @@ def load_local_remembered_session():
 
 
 def clear_local_remembered_session():
-    if os.path.exists(REMEMBER_ME_FILE):
+    if os.path.exists(".remembered_session.json"):
         try:
-            os.remove(REMEMBER_ME_FILE)
+            os.remove(".remembered_session.json")
         except Exception:
             pass
 
@@ -89,6 +107,7 @@ def save_student_compact(
     semesters_dict,
     daily_logs=None,
     daily_slot_ticks=None,
+    slot7_extra_map=None,
     password_hash=None,
     guide_completed=None,
     target_attendance_pct=None,
@@ -112,6 +131,7 @@ def save_student_compact(
 
     final_logs = existing_rec.get("daily_logs", {}) if daily_logs is None else daily_logs
     final_ticks = existing_rec.get("daily_slot_ticks", {}) if daily_slot_ticks is None else daily_slot_ticks
+    final_slot7 = existing_rec.get("slot7_extra_map", {}) if slot7_extra_map is None else slot7_extra_map
     final_pw = existing_rec.get("password_hash", "") if password_hash is None else password_hash
     final_guide = existing_rec.get("guide_completed", False) if guide_completed is None else guide_completed
     final_target = existing_rec.get("target_attendance_pct", 75) if target_attendance_pct is None else target_attendance_pct
@@ -124,11 +144,12 @@ def save_student_compact(
         "password_hash": final_pw,
         "guide_completed": final_guide,
         "target_attendance_pct": int(final_target),
-        "storage_mode": "unattended_v4",
+        "storage_mode": "unattended_v6",
         "last_updated": get_ist_now().strftime("%Y-%m-%d %H:%M:%S IST"),
         "data": compact_sems,
         "daily_logs": final_logs,
         "daily_slot_ticks": final_ticks,
+        "slot7_extra_map": final_slot7,
     }
     with open(STUDENT_DB_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f)
@@ -165,7 +186,7 @@ def update_student_visit(email, name, branch, batch):
     log_df.to_csv(VISITOR_LOG_FILE, index=False)
 
 
-# --- CONTEXTUAL STEP GUIDE BESIDE LINKED ELEMENT ---
+# --- CONTEXTUAL STEP GUIDE ---
 def apply_guide_blur_css():
     st.markdown(
         """
@@ -221,6 +242,7 @@ def render_side_guide_card(step_num, total_steps, title, message, state_key, arr
                 st.session_state.saved_semesters,
                 st.session_state.daily_logs,
                 st.session_state.daily_slot_ticks,
+                st.session_state.slot7_extra_map,
                 guide_completed=True,
                 target_attendance_pct=st.session_state.get("target_attendance_pct", 75),
             )
@@ -541,10 +563,19 @@ def extract_batch_specific_entry(raw_entry: str, batch_letter: str):
 
 
 def match_subject_short_form(entry_text: str, subject_stats_dict: dict):
-    if "Workshop" in entry_text or "WS-I" in entry_text:
+    """Matches either a Short Form (e.g., 'CP', 'FEM-I') OR a Course Code (e.g., '25FE1VSEC02')."""
+    clean_up = entry_text.strip().upper()
+    if not clean_up:
+        return None
+    if "WORKSHOP" in clean_up or "WS-I" in clean_up:
         return "WS-I" if "WS-I" in subject_stats_dict else None
+    # Check exact or substring match for Course Code first
+    for sf_code, info in subject_stats_dict.items():
+        if info["code"].upper() in clean_up:
+            return sf_code
+    # Then check Short Form (longest first so FEM-I matches before EM)
     for sf_code in sorted(subject_stats_dict.keys(), key=len, reverse=True):
-        if sf_code in entry_text:
+        if sf_code.upper() in clean_up:
             return sf_code
     return None
 
@@ -652,11 +683,10 @@ BATCH_OPTIONS = ["Batch A", "Batch B", "Batch C"]
 
 def hydrate_semesters_for_user(user_obj):
     saved_student_data = user_obj.get("data", {})
-    mode = user_obj.get("storage_mode", "")
     sem_dict_out = {}
     for sem, courses in SEMESTER_DATA.items():
         temp_df = pd.DataFrame(courses)
-        if mode in ["unattended_v3", "unattended_v4"] and sem in saved_student_data:
+        if sem in saved_student_data:
             sem_dict = saved_student_data[sem]
             for idx, row in temp_df.iterrows():
                 code = row["Course Code"]
@@ -665,13 +695,14 @@ def hydrate_semesters_for_user(user_obj):
                     vals = sem_dict[code]
                     temp_df.loc[idx, "Importance (1-3)"] = vals[0]
                     temp_df.loc[idx, "Unattended"] = min(tot_lec, max(0, int(vals[1])))
-                    temp_df.loc[idx, "Extra Lectures Attended"] = vals[2] if len(vals) > 2 else 0
+                    base_extra = vals[2] if len(vals) > 2 else 0
+                    temp_df.loc[idx, "Extra Lectures Attended"] = max(0, int(base_extra))
         temp_df.index = range(1, len(temp_df) + 1)
         sem_dict_out[sem] = temp_df
     return sem_dict_out
 
 
-# --- DUAL AUTO-LOGIN: URL QUERY PARAMS + LOCAL REMEMBER-ME FILE ---
+# --- AUTO-LOGIN ---
 query_params = st.query_params
 saved_email = query_params.get("email", "").strip().lower()
 saved_token = query_params.get("token", "").strip()
@@ -679,8 +710,6 @@ local_rem = load_local_remembered_session()
 
 if "student_logged_in" not in st.session_state:
     all_db = load_all_students_db()
-
-    # If URL doesn't have email, fall back to local `.remembered_session.json` so restarting Streamlit logs right in!
     if not saved_email and local_rem and not query_params.get("logged_out"):
         saved_email = local_rem.get("email", "").strip().lower()
         saved_token = local_rem.get("token", "").strip()
@@ -708,7 +737,6 @@ if "student_logged_in" not in st.session_state:
 if "dashboard_guide_step" not in st.session_state:
     st.session_state.dashboard_guide_step = 99 if st.session_state.get("guide_completed", False) else 1
 
-# Hydrate session state for logged-in student
 if st.session_state.get("student_logged_in", False) and "saved_semesters" not in st.session_state:
     email_key = st.session_state.student_email.strip().lower()
     all_db = load_all_students_db()
@@ -718,21 +746,22 @@ if st.session_state.get("student_logged_in", False) and "saved_semesters" not in
     st.session_state.target_attendance_pct = int(user_obj.get("target_attendance_pct", 75))
     st.session_state.daily_logs = user_obj.get("daily_logs", {})
     st.session_state.daily_slot_ticks = user_obj.get("daily_slot_ticks", {})
+    st.session_state.slot7_extra_map = user_obj.get("slot7_extra_map", {})
     st.session_state.saved_semesters = hydrate_semesters_for_user(user_obj)
 
-# --- STEP 0: LOGIN & PASSWORD AUTHENTICATION ---
+# --- LOGIN SCREEN ---
 if not st.session_state.get("student_logged_in", False):
     st.title("Attendance, Timetable & Calendar Tracker")
     st.subheader("Student Login & Password Verification")
-    st.caption("Keep 'Remember Me' ticked so restarting the app or reopening the browser logs you in automatically without asking again.")
+    st.caption("Keep 'Remember Me' ticked so restarting the app or reopening the browser logs you in automatically.")
 
     with st.form("student_login_form"):
         input_email = st.text_input("Enter Your Gmail Address (must end with @gmail.com):")
-        input_password = st.text_input("Enter Your Password (if new user, this will be saved as your password):", type="password")
+        input_password = st.text_input("Enter Your Password:", type="password")
         input_name = st.text_input("Enter Your Real Full Name (Required for first-time registration):")
         input_branch = st.selectbox("Select Your Branch:", BRANCH_OPTIONS)
         input_batch = st.selectbox("Select Your College Batch:", BATCH_OPTIONS)
-        remember_me = st.checkbox("Remember Me automatically (Never ask me to login again)", value=True)
+        remember_me = st.checkbox("Remember Me automatically", value=True)
         submit_btn = st.form_submit_button("Login / Register & Enter Dashboard")
 
         if submit_btn:
@@ -743,8 +772,13 @@ if not st.session_state.get("student_logged_in", False):
             if not clean_email.endswith("@gmail.com"):
                 st.error("Invalid email domain. Please use a valid Gmail address ending with '@gmail.com'.")
             elif not clean_pw:
-                st.error("Please enter a password to secure your account.")
+                st.error("Please enter a password.")
             else:
+                # If logging in as Admin Gmail, enforce the Admin Password ("G!nt0k1.")
+                if clean_email == ADMIN_EMAIL.lower() and clean_pw != ADMIN_PASSWORD_PLAIN:
+                    st.error("Invalid password for Admin Gmail account.")
+                    st.stop()
+
                 all_db = load_all_students_db()
                 pw_hashed = hash_password(clean_pw)
                 is_existing_user = clean_email in all_db
@@ -752,20 +786,20 @@ if not st.session_state.get("student_logged_in", False):
                 if is_existing_user:
                     user_obj = all_db[clean_email]
                     stored_hash = user_obj.get("password_hash", "")
-                    if stored_hash and stored_hash != pw_hashed:
-                        st.error("Incorrect password for this Gmail account. Please try again.")
+                    if stored_hash and stored_hash != pw_hashed and clean_email != ADMIN_EMAIL.lower():
+                        st.error("Incorrect password for this Gmail account.")
                         st.stop()
-                    final_name = clean_name if clean_name else user_obj.get("name", "Student")
+                    final_name = clean_name if clean_name else user_obj.get("name", "Kanishka Maya Honrao" if clean_email == ADMIN_EMAIL.lower() else "Student")
                     final_branch = user_obj.get("branch", input_branch)
                     final_batch = user_obj.get("batch", input_batch)
                     guide_done = True
                     st.session_state.dashboard_guide_step = 99
                 else:
-                    if not clean_name:
+                    if not clean_name and clean_email != ADMIN_EMAIL.lower():
                         st.error("First-time registration requires your Real Full Name.")
                         st.stop()
                     user_obj = {}
-                    final_name = clean_name
+                    final_name = clean_name if clean_name else "Kanishka Maya Honrao"
                     final_branch = input_branch
                     final_batch = input_batch
                     guide_done = False
@@ -781,6 +815,7 @@ if not st.session_state.get("student_logged_in", False):
 
                 st.session_state.daily_logs = user_obj.get("daily_logs", {})
                 st.session_state.daily_slot_ticks = user_obj.get("daily_slot_ticks", {})
+                st.session_state.slot7_extra_map = user_obj.get("slot7_extra_map", {})
                 st.session_state.saved_semesters = hydrate_semesters_for_user(user_obj)
 
                 save_student_compact(
@@ -791,6 +826,7 @@ if not st.session_state.get("student_logged_in", False):
                     st.session_state.saved_semesters,
                     st.session_state.daily_logs,
                     st.session_state.daily_slot_ticks,
+                    st.session_state.slot7_extra_map,
                     password_hash=pw_hashed,
                     guide_completed=guide_done,
                     target_attendance_pct=st.session_state.target_attendance_pct,
@@ -814,6 +850,12 @@ if not st.session_state.get("student_logged_in", False):
     )
     st.stop()
 
+if st.query_params.get("email") and st.query_params.get("token"):
+    save_local_remembered_session(st.query_params["email"], st.query_params["token"])
+
+if "slot7_extra_map" not in st.session_state:
+    st.session_state.slot7_extra_map = {}
+
 # --- MAIN DASHBOARD ---
 active_step = st.session_state.dashboard_guide_step
 guide_is_active = (not st.session_state.get("guide_completed", True)) and (active_step in [1, 2, 3, 4])
@@ -824,7 +866,7 @@ greeting = get_time_greeting()
 st.title(f"{greeting}, {st.session_state.student_name}")
 st.caption(f"**Branch:** {st.session_state.student_branch} | **Batch:** {st.session_state.get('student_batch', 'Batch A')} | **Verified Gmail:** {st.session_state.student_email}")
 
-# --- TOP BAR: DESIRED ATTENDANCE PERCENTAGE INPUT (MINIMUM 75%) ---
+# --- TOP BAR: DESIRED ATTENDANCE PERCENTAGE ---
 st.markdown("### Custom Target Attendance Percentage")
 t_col1, t_col2, t_col3 = st.columns([1.6, 1.4, 1])
 
@@ -858,6 +900,7 @@ with t_col2:
             st.session_state.saved_semesters,
             st.session_state.daily_logs,
             st.session_state.daily_slot_ticks,
+            st.session_state.slot7_extra_map,
             target_attendance_pct=int(target_att_pct),
         )
 
@@ -886,8 +929,51 @@ if new_selected_batch != st.session_state.get("student_batch"):
         st.session_state.saved_semesters,
         st.session_state.daily_logs,
         st.session_state.daily_slot_ticks,
+        st.session_state.slot7_extra_map,
     )
     st.rerun()
+
+# --- ADMIN POWER PANEL (EXCLUSIVELY FOR KANISHKA WITH PASSWORD "G!nt0k1.") ---
+is_kanishka = st.session_state.student_email.strip().lower() == ADMIN_EMAIL.strip().lower()
+if is_kanishka:
+    st.sidebar.markdown("---")
+    st.sidebar.header("Admin Power Panel")
+    admin_auth = st.sidebar.text_input("Enter Admin Password:", type="password", key="sidebar_admin_pwd")
+    if admin_auth == ADMIN_PASSWORD_PLAIN:
+        st.sidebar.success("Admin Power Unlocked (Linked to your Gmail)")
+        global_extras_current = load_admin_global_extras()
+        st.sidebar.write("**Broadcast Extra Lectures (Visible to Everyone Else Other Than You):**")
+        target_sem_for_admin = st.sidebar.selectbox("Select Semester:", list(SEMESTER_DATA.keys()), key="admin_sem_pick")
+        admin_course_options = {f"{c['Short Form']} - {c['Course Name']} ({c['Course Code']})": c["Course Code"] for c in SEMESTER_DATA[target_sem_for_admin]}
+        chosen_course_label = st.sidebar.selectbox("Select Subject:", list(admin_course_options.keys()), key="admin_subj_pick")
+        chosen_course_code = admin_course_options[chosen_course_label]
+        current_pushed_val = int(global_extras_current.get(chosen_course_code, 0))
+        extra_count_to_push = st.sidebar.number_input(
+            "Extra Lectures for All Other Students:",
+            min_value=0,
+            value=current_pushed_val,
+            step=1,
+            key="admin_extra_num",
+        )
+
+        if st.sidebar.button("Broadcast Extra Lectures to Other Students", width="stretch"):
+            global_extras_current[chosen_course_code] = int(extra_count_to_push)
+            save_admin_global_extras(global_extras_current)
+            st.sidebar.success(f"Broadcasted {extra_count_to_push} extra lecture(s) for {chosen_course_code} to all other students!")
+
+        if global_extras_current:
+            st.sidebar.caption("Active Global Extra Lectures (Applied to other students):")
+            st.sidebar.json(global_extras_current)
+
+        with st.sidebar.expander("View Student Visitor Log (Admin Only)", expanded=False):
+            if os.path.exists(VISITOR_LOG_FILE):
+                log_df = pd.read_csv(VISITOR_LOG_FILE)
+                log_df.index = range(1, len(log_df) + 1)
+                st.dataframe(log_df, width="stretch")
+            else:
+                st.write("No students have logged in yet.")
+    elif admin_auth:
+        st.sidebar.error("Incorrect Admin Password.")
 
 if st.sidebar.button("Switch Student / Logout", disabled=guide_is_active):
     clear_local_remembered_session()
@@ -912,6 +998,7 @@ if st.sidebar.button(f"Reset {selected_semester} Missed Lectures to 0", disabled
     st.session_state.saved_semesters[selected_semester] = reset_df
     st.session_state.daily_logs = {}
     st.session_state.daily_slot_ticks = {}
+    st.session_state.slot7_extra_map = {}
     save_student_compact(
         st.session_state.student_email,
         st.session_state.student_name,
@@ -920,6 +1007,7 @@ if st.sidebar.button(f"Reset {selected_semester} Missed Lectures to 0", disabled
         st.session_state.saved_semesters,
         st.session_state.daily_logs,
         st.session_state.daily_slot_ticks,
+        st.session_state.slot7_extra_map,
     )
     st.rerun()
 
@@ -945,9 +1033,12 @@ target_credits = st.sidebar.number_input(
 )
 
 
-# --- HELPER TO COMPUTE DERIVED COLUMNS USING DYNAMIC TARGET ATTENDANCE % ---
-def compute_attendance_metrics(base_df, target_pct_val: int):
+# --- HELPER TO COMPUTE DERIVED COLUMNS (INCLUDING ADMIN BROADCAST FOR NON-ADMIN STUDENTS) ---
+def compute_attendance_metrics(base_df, target_pct_val: int, current_user_email: str):
     t_ratio = target_pct_val / 100.0
+    is_admin_user = current_user_email.strip().lower() == ADMIN_EMAIL.strip().lower()
+    global_extras = load_admin_global_extras()
+
     df = base_df.copy()
     df["Credits"] = pd.to_numeric(df["Credits"], errors="coerce").fillna(3).astype(int)
     df["Importance (1-3)"] = pd.to_numeric(df["Importance (1-3)"], errors="coerce").fillna(2).astype(int)
@@ -961,8 +1052,15 @@ def compute_attendance_metrics(base_df, target_pct_val: int):
         df["Extra Lectures Attended"] = 0
     df["Extra Lectures Attended"] = pd.to_numeric(df["Extra Lectures Attended"], errors="coerce").fillna(0).clip(lower=0).astype(int)
 
+    # Admin Broadcasted Extra Lectures: Visible ONLY to everyone else OTHER than Admin (Kanishka)
+    if not is_admin_user:
+        df["Admin Broadcast Extra"] = df["Course Code"].apply(lambda c: int(global_extras.get(c, 0)))
+    else:
+        df["Admin Broadcast Extra"] = 0
+
+    df["Total Extra Lectures"] = df["Extra Lectures Attended"] + df["Admin Broadcast Extra"]
     df["Regular Attended"] = (df["Total Lectures"] - df["Unattended"]).clip(lower=0)
-    df["Effective Attended"] = (df["Regular Attended"] + df["Extra Lectures Attended"]).clip(upper=df["Total Lectures"])
+    df["Effective Attended"] = (df["Regular Attended"] + df["Total Extra Lectures"]).clip(upper=df["Total Lectures"])
     df["Effective Unattended"] = (df["Total Lectures"] - df["Effective Attended"]).clip(lower=0)
 
     df["Unattended / Total"] = df["Unattended"].astype(str) + " / " + df["Total Lectures"].astype(str)
@@ -973,7 +1071,7 @@ def compute_attendance_metrics(base_df, target_pct_val: int):
     df["Max Allowed Bunks"] = df["Total Lectures"] - df["Required for Target"]
     df["Safe Bunks Left"] = (df["Max Allowed Bunks"] - df["Effective Unattended"]).clip(lower=0)
     df["Status"] = df["Current Attendance %"].apply(
-        lambda x: f"Safe (>={target_pct_val}%)" if x >= target_pct_val else f"Shortage (<{target_pct_val}%)"
+        lambda x: f"Safe (>={target_att_pct}%)" if x >= target_att_pct else f"Shortage (<{target_att_pct}%)"
     )
     return df
 
@@ -1026,6 +1124,7 @@ with sec1_wrapper:
                 st.session_state.saved_semesters,
                 st.session_state.daily_logs,
                 st.session_state.daily_slot_ticks,
+                st.session_state.slot7_extra_map,
             )
             st.rerun()
 
@@ -1040,7 +1139,15 @@ with sec1_wrapper:
                 arrow_dir="left",
             )
 
-df = compute_attendance_metrics(st.session_state.saved_semesters[selected_semester], target_att_pct)
+df = compute_attendance_metrics(
+    st.session_state.saved_semesters[selected_semester],
+    target_att_pct,
+    st.session_state.student_email,
+)
+
+# Show banner for non-admin students if Admin broadcasted global extra lectures
+if not is_kanishka and int(df["Admin Broadcast Extra"].sum()) > 0:
+    st.info(f"Admin Broadcast Active: {int(df['Admin Broadcast Extra'].sum())} extra college-wide lecture(s) have been automatically included in your attendance calculation.")
 
 subject_stats_by_short = {}
 for _, r in df.iterrows():
@@ -1050,7 +1157,7 @@ for _, r in df.iterrows():
         "name": r["Course Name"],
         "unattended": int(r["Unattended"]),
         "regular_attended": int(r["Regular Attended"]),
-        "extra": int(r["Extra Lectures Attended"]),
+        "extra": int(r["Total Extra Lectures"]),
         "effective": int(r["Effective Attended"]),
         "total": int(r["Total Lectures"]),
         "pct": float(r["Current Attendance %"]),
@@ -1079,7 +1186,7 @@ with sec2_wrapper:
     mcol3.metric(f"Safe Bunks Left (for {target_att_pct}%)", f"{total_safe_bunks} bunks left")
     mcol4.metric(f"Classes Needed for {target_att_pct}%", f"{total_classes_needed} classes")
 
-# --- SECTION 3: TABLE-BORDERED COMPACT CALENDAR & DAY CLICK INSPECTOR WITH UNATTENDED TICK ---
+# --- SECTION 3: TABLE-BORDERED COMPACT CALENDAR & DAY CLICK INSPECTOR ---
 sec3_wrapper = st.container()
 with sec3_wrapper:
     if guide_is_active and active_step in [1, 3, 4]:
@@ -1207,43 +1314,94 @@ with sec3_wrapper:
                 day_slots = active_grid[d_key]
 
                 saved_day_ticks = st.session_state.daily_slot_ticks.get(inspected_iso, {})
+                saved_slot7_sf = st.session_state.slot7_extra_map.get(inspected_iso, "")
 
-                st.caption("Tick **Unattended (Tick)** beside any lecture/lab below (available for past and current dates). Ticking automatically updates your subject Unattended counts and calendar badge!")
+                st.caption(
+                    "**Slots 1 to 6 (9:00 AM – 4:00 PM) are non-editable.** Joined bulk lectures (like CP 3–4 or 2-hour Labs) are merged into **1 single unit**. "
+                    "**Only the 4:00 PM – 5:00 PM slot is editable** for Extra Lectures!"
+                )
+
+                # Extract slots and merge continuous identical subjects (e.g., CP slots 3 & 4) into ONE single bulk lecture
+                raw_extracted_slots = []
+                for s_idx, (slot_label, raw_subj_entry) in enumerate(zip(TIME_SLOTS, day_slots)):
+                    if s_idx == 8 and saved_slot7_sf:
+                        batch_filtered_entry = f"Extra Lecture: {saved_slot7_sf}"
+                        is_batch_lab = False
+                        matched_sf = saved_slot7_sf
+                    else:
+                        batch_filtered_entry, is_batch_lab = extract_batch_specific_entry(raw_subj_entry, batch_letter)
+                        matched_sf = match_subject_short_form(batch_filtered_entry, subject_stats_by_short)
+                    raw_extracted_slots.append((s_idx, slot_label, batch_filtered_entry, matched_sf, is_batch_lab))
+
+                processed_slots_view = []
+                i = 0
+                while i < len(raw_extracted_slots):
+                    s_idx, slot_label, entry_text, m_sf, is_lab = raw_extracted_slots[i]
+                    # Merge consecutive identical subject slots (excluding breaks and slot 7) into 1 single bulk lecture unit
+                    if (
+                        m_sf
+                        and s_idx < 8
+                        and i + 1 < len(raw_extracted_slots)
+                        and raw_extracted_slots[i + 1][3] == m_sf
+                        and raw_extracted_slots[i + 1][0] < 8
+                    ):
+                        end_i = i + 1
+                        while (
+                            end_i < len(raw_extracted_slots)
+                            and raw_extracted_slots[end_i][3] == m_sf
+                            and raw_extracted_slots[end_i][0] < 8
+                        ):
+                            end_i += 1
+                        end_i -= 1
+
+                        start_slot_num = slot_label.split("(")[0].strip()
+                        end_slot_num = raw_extracted_slots[end_i][1].split("(")[0].strip()
+                        start_time_str = slot_label.split("(")[1].split("-")[0].strip()
+                        end_time_str = raw_extracted_slots[end_i][1].split("-")[1].split(")")[0].strip()
+
+                        combined_slot_label = f"Slots {start_slot_num}-{end_slot_num} ({start_time_str} - {end_time_str}) [1 Bulk Unit]"
+                        combined_entry_label = f"{entry_text} (1 Combined Bulk Lecture)"
+                        group_indices = list(range(i, end_i + 1))
+
+                        processed_slots_view.append((group_indices[0], combined_slot_label, combined_entry_label, m_sf, is_lab, group_indices))
+                        i = end_i + 1
+                    else:
+                        processed_slots_view.append((s_idx, slot_label, entry_text, m_sf, is_lab, [s_idx]))
+                        i += 1
 
                 daily_rows = []
-                slot_subject_codes = []
-                for s_idx, (slot_label, raw_subj_entry) in enumerate(zip(TIME_SLOTS, day_slots)):
-                    batch_filtered_entry, is_batch_lab = extract_batch_specific_entry(raw_subj_entry, batch_letter)
-                    matched_sf = match_subject_short_form(batch_filtered_entry, subject_stats_by_short)
-                    slot_subject_codes.append(matched_sf)
-
-                    display_subj = batch_filtered_entry
-                    if is_batch_lab:
-                        display_subj = f"{batch_filtered_entry} [YOUR {student_batch.upper()} LAB]"
+                for s_idx, slot_label, display_subj, matched_sf, is_lab, g_indices in processed_slots_view:
+                    if is_lab:
+                        display_subj = f"{display_subj} [YOUR {student_batch.upper()} LAB]"
 
                     if matched_sf and matched_sf in subject_stats_by_short:
                         st_info = subject_stats_by_short[matched_sf]
-                        need_str = (
-                            f"Missed: {st_info['unattended']}/{st_info['total']} | Need {st_info['needed']} for {target_att_pct}% (Curr: {st_info['pct']}%)"
-                            if st_info["needed"] > 0
-                            else f"Missed: {st_info['unattended']}/{st_info['total']} | Safe: Bunk {st_info['bunks']} (Curr: {st_info['pct']}%)"
-                        )
+                        if s_idx == 8 and saved_slot7_sf:
+                            need_str = f"Auto-Added +1 Extra Lecture to {matched_sf} (Curr: {st_info['pct']}%)"
+                        elif st_info["needed"] > 0:
+                            need_str = f"Missed: {st_info['unattended']}/{st_info['total']} | Need {st_info['needed']} for {target_att_pct}% (Curr: {st_info['pct']}%)"
+                        else:
+                            need_str = f"Missed: {st_info['unattended']}/{st_info['total']} | Safe: Bunk {st_info['bunks']} (Curr: {st_info['pct']}%)"
                     else:
-                        need_str = "Break / Non-Credit Slot"
+                        need_str = "Editable 4-5 PM Extra Slot" if s_idx == 8 else "Break / Non-Credit Slot"
 
-                    is_ticked = bool(saved_day_ticks.get(str(s_idx), False))
+                    is_ticked = any(bool(saved_day_ticks.get(str(g_sub), False)) for g_sub in g_indices)
                     daily_rows.append({
                         "Unattended (Tick)": is_ticked,
                         "Time Slot": slot_label,
-                        "Lecture / Lab (Batch Filtered)": display_subj,
+                        "Lecture / Lab (Locked 9AM-4PM)": display_subj,
                         f"{target_att_pct}% Status": need_str,
                     })
 
                 daily_df_editor_source = pd.DataFrame(daily_rows)
+
+                # Lock ALL text columns in the table so 9 AM - 4 PM slots CANNOT be edited; only Unattended (Tick) is clickable here
                 edited_daily_df = st.data_editor(
                     daily_df_editor_source,
                     num_rows="fixed",
-                    disabled=["Time Slot", "Lecture / Lab (Batch Filtered)", f"{target_att_pct}% Status"] if not guide_is_active else list(daily_df_editor_source.columns),
+                    disabled=["Time Slot", "Lecture / Lab (Locked 9AM-4PM)", f"{target_att_pct}% Status"]
+                    if not guide_is_active
+                    else list(daily_df_editor_source.columns),
                     column_config={
                         "Unattended (Tick)": st.column_config.CheckboxColumn("Unattended (Tick)", default=False),
                     },
@@ -1252,40 +1410,102 @@ with sec3_wrapper:
                     key=f"daily_tick_editor_{inspected_iso}_{student_batch}",
                 )
 
-                if not guide_is_active and not edited_daily_df["Unattended (Tick)"].equals(daily_df_editor_source["Unattended (Tick)"]):
-                    new_ticks_for_day = {}
-                    missed_short_forms_today = []
-                    total_credit_slots_today = 0
-                    ticked_credit_slots_today = 0
+                # Dedicated Editable 4:00 PM - 5:00 PM Slot Input (ONLY Slot 7 is editable!)
+                st.markdown("##### Edit 4:00 PM – 5:00 PM Slot Only (Auto-Counts as Extra Lecture)")
+                slot7_col1, slot7_col2 = st.columns([2.2, 1])
+                with slot7_col1:
+                    typed_slot7_code = st.text_input(
+                        "Enter Subject Short Form or Course Code for 4:00 PM – 5:00 PM (e.g., CP, FEM-I, AP, EC, EG, BE&DE, WS-I, UHV):",
+                        value=saved_slot7_sf,
+                        key=f"slot7_input_{inspected_iso}",
+                        disabled=guide_is_active,
+                    )
+                with slot7_col2:
+                    st.write("")
+                    st.write("")
+                    apply_slot7_btn = st.button(
+                        "Save 4-5 PM Extra Lecture",
+                        key=f"save_slot7_{inspected_iso}",
+                        width="stretch",
+                        disabled=guide_is_active,
+                    )
 
+                if apply_slot7_btn and not guide_is_active:
                     sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
+                    new_matched_sf = match_subject_short_form(typed_slot7_code, subject_stats_by_short) if typed_slot7_code.strip() else None
 
-                    for s_idx, matched_sf in enumerate(slot_subject_codes):
-                        old_tick = bool(daily_df_editor_source.loc[s_idx, "Unattended (Tick)"])
-                        new_tick = bool(edited_daily_df.loc[s_idx, "Unattended (Tick)"])
-                        new_ticks_for_day[str(s_idx)] = new_tick
+                    if typed_slot7_code.strip() and not new_matched_sf:
+                        st.error("Unrecognized subject code/short-form. Use FEM-I, AP, EC, EG, BE&DE, WS-I, CP, or UHV (or exact course code).")
+                    else:
+                        # Remove previous extra lecture if one was already logged on this date's 4-5 PM slot
+                        if saved_slot7_sf and saved_slot7_sf != new_matched_sf:
+                            old_mask = sem_df_ref["Short Form"] == saved_slot7_sf
+                            for r_i_sem in sem_df_ref[old_mask].index:
+                                curr_ex = int(sem_df_ref.loc[r_i_sem, "Extra Lectures Attended"])
+                                sem_df_ref.loc[r_i_sem, "Extra Lectures Attended"] = max(0, curr_ex - 1)
 
-                        if matched_sf:
-                            total_credit_slots_today += 1
+                        # Add +1 Extra Lecture Attended if a new valid subject was entered
+                        if new_matched_sf and new_matched_sf != saved_slot7_sf:
+                            new_mask = sem_df_ref["Short Form"] == new_matched_sf
+                            for r_i_sem in sem_df_ref[new_mask].index:
+                                curr_ex = int(sem_df_ref.loc[r_i_sem, "Extra Lectures Attended"])
+                                sem_df_ref.loc[r_i_sem, "Extra Lectures Attended"] = curr_ex + 1
+
+                        if new_matched_sf:
+                            st.session_state.slot7_extra_map[inspected_iso] = new_matched_sf
+                        else:
+                            st.session_state.slot7_extra_map.pop(inspected_iso, None)
+
+                        st.session_state.saved_semesters[selected_semester] = sem_df_ref
+                        save_student_compact(
+                            st.session_state.student_email,
+                            st.session_state.student_name,
+                            st.session_state.student_branch,
+                            st.session_state.get("student_batch", "Batch A"),
+                            st.session_state.saved_semesters,
+                            st.session_state.daily_logs,
+                            st.session_state.daily_slot_ticks,
+                            st.session_state.slot7_extra_map,
+                        )
+                        st.rerun()
+
+                # Sync Unattended Ticks (Bulk blocks count as 1 single lecture unit!)
+                if not guide_is_active and not edited_daily_df["Unattended (Tick)"].equals(daily_df_editor_source["Unattended (Tick)"]):
+                    sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
+                    new_ticks_for_day = saved_day_ticks.copy()
+                    missed_short_forms_today = []
+                    total_credit_units_today = 0
+                    ticked_credit_units_today = 0
+
+                    for r_i, (s_head_idx, s_lab, orig_sub, matched_sf, i_lab, g_inds) in enumerate(processed_slots_view):
+                        old_tick = bool(daily_df_editor_source.loc[r_i, "Unattended (Tick)"])
+                        new_tick = bool(edited_daily_df.loc[r_i, "Unattended (Tick)"])
+
+                        for g_sub in g_inds:
+                            new_ticks_for_day[str(g_sub)] = new_tick
+
+                        if matched_sf and s_head_idx < 8:
+                            total_credit_units_today += 1
                             if new_tick:
-                                ticked_credit_slots_today += 1
+                                ticked_credit_units_today += 1
                                 if matched_sf not in missed_short_forms_today:
                                     missed_short_forms_today.append(matched_sf)
 
+                            # Even if g_inds has 2 slots (like CP 3 & 4), delta is strictly +1 or -1 (1 single bulk lecture!)
                             if new_tick != old_tick:
                                 delta = 1 if new_tick else -1
                                 mask = sem_df_ref["Short Form"] == matched_sf
-                                for r_i in sem_df_ref[mask].index:
-                                    curr_u = int(sem_df_ref.loc[r_i, "Unattended"])
-                                    max_t = int(sem_df_ref.loc[r_i, "Total Lectures"])
-                                    sem_df_ref.loc[r_i, "Unattended"] = min(max_t, max(0, curr_u + delta))
+                                for r_i_sem in sem_df_ref[mask].index:
+                                    curr_u = int(sem_df_ref.loc[r_i_sem, "Unattended"])
+                                    max_t = int(sem_df_ref.loc[r_i_sem, "Total Lectures"])
+                                    sem_df_ref.loc[r_i_sem, "Unattended"] = min(max_t, max(0, curr_u + delta))
 
                     st.session_state.daily_slot_ticks[inspected_iso] = new_ticks_for_day
                     st.session_state.saved_semesters[selected_semester] = sem_df_ref
 
-                    if ticked_credit_slots_today == 0:
+                    if ticked_credit_units_today == 0:
                         st.session_state.daily_logs.pop(inspected_iso, None)
-                    elif total_credit_slots_today > 0 and ticked_credit_slots_today >= total_credit_slots_today:
+                    elif total_credit_units_today > 0 and ticked_credit_units_today >= total_credit_units_today:
                         st.session_state.daily_logs[inspected_iso] = "F"
                     else:
                         st.session_state.daily_logs[inspected_iso] = ", ".join(missed_short_forms_today)
@@ -1298,6 +1518,7 @@ with sec3_wrapper:
                         st.session_state.saved_semesters,
                         st.session_state.daily_logs,
                         st.session_state.daily_slot_ticks,
+                        st.session_state.slot7_extra_map,
                     )
                     st.rerun()
 
@@ -1306,16 +1527,18 @@ with sec3_wrapper:
                     if st.button("Tick Full Day Bunk ('F')", key=f"full_bunk_{inspected_iso}", width="stretch", disabled=guide_is_active):
                         sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
                         new_ticks_for_day = {}
-                        for s_idx, matched_sf in enumerate(slot_subject_codes):
-                            old_tick = bool(saved_day_ticks.get(str(s_idx), False))
-                            if matched_sf:
-                                new_ticks_for_day[str(s_idx)] = True
-                                if not old_tick:
+                        for r_i, (s_head_idx, s_lab, orig_sub, matched_sf, i_lab, g_inds) in enumerate(processed_slots_view):
+                            was_ticked = any(bool(saved_day_ticks.get(str(g_sub), False)) for g_sub in g_inds)
+                            if matched_sf and s_head_idx < 8:
+                                for g_sub in g_inds:
+                                    new_ticks_for_day[str(g_sub)] = True
+                                if not was_ticked:
                                     mask = sem_df_ref["Short Form"] == matched_sf
-                                    for r_i in sem_df_ref[mask].index:
-                                        curr_u = int(sem_df_ref.loc[r_i, "Unattended"])
-                                        max_t = int(sem_df_ref.loc[r_i, "Total Lectures"])
-                                        sem_df_ref.loc[r_i, "Unattended"] = min(max_t, curr_u + 1)
+                                    for r_i_sem in sem_df_ref[mask].index:
+                                        curr_u = int(sem_df_ref.loc[r_i_sem, "Unattended"])
+                                        max_t = int(sem_df_ref.loc[r_i_sem, "Total Lectures"])
+                                        # Adds +1 per merged bulk unit
+                                        sem_df_ref.loc[r_i_sem, "Unattended"] = min(max_t, curr_u + 1)
                         st.session_state.daily_slot_ticks[inspected_iso] = new_ticks_for_day
                         st.session_state.daily_logs[inspected_iso] = "F"
                         st.session_state.saved_semesters[selected_semester] = sem_df_ref
@@ -1327,19 +1550,20 @@ with sec3_wrapper:
                             st.session_state.saved_semesters,
                             st.session_state.daily_logs,
                             st.session_state.daily_slot_ticks,
+                            st.session_state.slot7_extra_map,
                         )
                         st.rerun()
 
                 with q_col2:
                     if st.button("Clear All Ticks (Attended All)", key=f"clear_bunk_{inspected_iso}", width="stretch", disabled=guide_is_active):
                         sem_df_ref = st.session_state.saved_semesters[selected_semester].copy()
-                        for s_idx, matched_sf in enumerate(slot_subject_codes):
-                            old_tick = bool(saved_day_ticks.get(str(s_idx), False))
-                            if matched_sf and old_tick:
+                        for r_i, (s_head_idx, s_lab, orig_sub, matched_sf, i_lab, g_inds) in enumerate(processed_slots_view):
+                            was_ticked = any(bool(saved_day_ticks.get(str(g_sub), False)) for g_sub in g_inds)
+                            if matched_sf and s_head_idx < 8 and was_ticked:
                                 mask = sem_df_ref["Short Form"] == matched_sf
-                                for r_i in sem_df_ref[mask].index:
-                                    curr_u = int(sem_df_ref.loc[r_i, "Unattended"])
-                                    sem_df_ref.loc[r_i, "Unattended"] = max(0, curr_u - 1)
+                                for r_i_sem in sem_df_ref[mask].index:
+                                    curr_u = int(sem_df_ref.loc[r_i_sem, "Unattended"])
+                                    sem_df_ref.loc[r_i_sem, "Unattended"] = max(0, curr_u - 1)
                         st.session_state.daily_slot_ticks.pop(inspected_iso, None)
                         st.session_state.daily_logs.pop(inspected_iso, None)
                         st.session_state.saved_semesters[selected_semester] = sem_df_ref
@@ -1351,6 +1575,7 @@ with sec3_wrapper:
                             st.session_state.saved_semesters,
                             st.session_state.daily_logs,
                             st.session_state.daily_slot_ticks,
+                            st.session_state.slot7_extra_map,
                         )
                         st.rerun()
 
@@ -1366,13 +1591,13 @@ with sec3_wrapper:
             render_side_guide_card(
                 2,
                 4,
-                "Step 2: Calendar & Unattended Tick Column",
-                "Click 'View' on any date (including past dates) and tick the 'Unattended (Tick)' box right beside any lecture/lab you missed. It automatically updates your total missed lectures everywhere! Click 'Got it' to continue.",
+                "Step 2: Locked Slots 1-6, Bulk Lectures & Editable 4-5 PM Slot",
+                "Slots 1-6 are locked. Joined classes like CP (Slots 3-4) are merged into 1 single bulk lecture unit. Only the 4:00 PM - 5:00 PM input box is editable and automatically adds +1 Extra Lecture! Click 'Got it'.",
                 "dashboard_guide_step",
                 arrow_dir="left",
             )
 
-# --- SECTION 4: EDITABLE & LINKED COLOUR-CODED SUBJECT TABLE ---
+# --- SECTION 4: EDITABLE SUBJECT TABLE ---
 sec4_wrapper = st.container()
 with sec4_wrapper:
     if guide_is_active and active_step in [1, 2, 4]:
@@ -1399,6 +1624,7 @@ with sec4_wrapper:
             "Course Name",
             "Unattended",
             "Extra Lectures Attended",
+            "Admin Broadcast Extra",
             "Regular Attended",
             "Unattended / Total",
             "Current Attendance %",
@@ -1416,6 +1642,7 @@ with sec4_wrapper:
                 "Short Form",
                 "Course Code",
                 "Course Name",
+                "Admin Broadcast Extra",
                 "Regular Attended",
                 "Unattended / Total",
                 "Current Attendance %",
@@ -1432,7 +1659,8 @@ with sec4_wrapper:
             disabled=sec4_disabled_cols,
             column_config={
                 "Unattended": st.column_config.NumberColumn("Unattended (Missed)", min_value=0, default=0, step=1),
-                "Extra Lectures Attended": st.column_config.NumberColumn("Extra Lectures Attended", min_value=0, default=0, step=1),
+                "Extra Lectures Attended": st.column_config.NumberColumn("Extra Lectures (Personal)", min_value=0, default=0, step=1),
+                "Admin Broadcast Extra": st.column_config.NumberColumn("Admin Extra (Global)"),
                 "Current Attendance %": st.column_config.NumberColumn("Current Attendance %", format="%.2f%%"),
                 "Required for Target": st.column_config.NumberColumn(f"Required for {target_att_pct}%"),
                 "Classes Needed for Target": st.column_config.NumberColumn(f"Classes Needed for {target_att_pct}%"),
@@ -1455,6 +1683,7 @@ with sec4_wrapper:
                 st.session_state.saved_semesters,
                 st.session_state.daily_logs,
                 st.session_state.daily_slot_ticks,
+                st.session_state.slot7_extra_map,
             )
             st.rerun()
 
@@ -1483,14 +1712,14 @@ with sec4_wrapper:
                 arrow_dir="left",
             )
 
-# --- SECTION 5: VERTICAL LARGE COLOUR-CODED TIMETABLE (BATCH-SPECIFIC LAB ATTENDANCE) + IMAGE REMOVE/PASTE ---
+# --- SECTION 5: VERTICAL LARGE TIMETABLE (MERGED BULK CELLS WITH ROWSPAN + BATCH-SPECIFIC LAB ATTENDANCE) ---
 sec5_wrapper = st.container()
 with sec5_wrapper:
     if guide_is_active and active_step in [1, 2, 3]:
         st.markdown('<div class="blur-target-block"></div>', unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("5. Vertical Timetable (Batch-Specific Lab Attendance) & Timetable Image Manager")
+    st.subheader("5. Vertical Timetable (Merged Bulk Lectures + Batch-Specific Lab Attendance) & Image Manager")
 
     if guide_is_active and active_step == 4:
         s5_col_main, s5_col_guide = st.columns([2.2, 1])
@@ -1502,7 +1731,41 @@ with sec5_wrapper:
     batch_letter = student_batch[-1].upper()
 
     def build_vertical_timetable_html(grid_dict):
+        """
+        Builds a vertical HTML timetable where MON..FRI are columns, and continuous multi-hour bulk blocks
+        (like Wednesday CP slots 3-4 or 2-hour Labs/Workshops) are merged into ONE single big cell using rowspan!
+        """
         days_order = ["MON", "TUE", "WED", "THR", "FRI"]
+        num_slots = len(TIME_SLOTS)
+
+        # Precompute rowspan matrix so continuous duplicate slots in the same day merge into 1 big cell
+        skip_cell = {d: [False] * num_slots for d in days_order}
+        rowspan_map = {d: [1] * num_slots for d in days_order}
+
+        for d_col in days_order:
+            s_i = 0
+            while s_i < num_slots:
+                raw_curr = grid_dict[d_col][s_i]
+                b_curr, _ = extract_batch_specific_entry(raw_curr, batch_letter)
+                sf_curr = match_subject_short_form(b_curr, subject_stats_by_short)
+
+                if sf_curr and s_i < 8:
+                    span = 1
+                    while (
+                        s_i + span < 8
+                        and match_subject_short_form(
+                            extract_batch_specific_entry(grid_dict[d_col][s_i + span], batch_letter)[0],
+                            subject_stats_by_short,
+                        )
+                        == sf_curr
+                    ):
+                        skip_cell[d_col][s_i + span] = True
+                        span += 1
+                    rowspan_map[d_col][s_i] = span
+                    s_i += span
+                else:
+                    s_i += 1
+
         html = '<table class="vertical-tt-table"><thead><tr>'
         html += '<th>TIME SLOT</th>'
         for d_col in days_order:
@@ -1513,9 +1776,13 @@ with sec5_wrapper:
             html += '<tr>'
             html += f'<td class="tt-slot-col">{slot_name}</td>'
             for d_col in days_order:
+                if skip_cell[d_col][slot_idx]:
+                    continue
+
                 raw_val = grid_dict[d_col][slot_idx]
                 batch_entry, is_batch_lab = extract_batch_specific_entry(raw_val, batch_letter)
                 matched_sf = match_subject_short_form(batch_entry, subject_stats_by_short)
+                r_span = rowspan_map[d_col][slot_idx]
 
                 cell_class = "tt-cell-blue"
                 att_subtext = ""
@@ -1532,10 +1799,13 @@ with sec5_wrapper:
                     )
 
                 display_val = batch_entry
+                if r_span > 1:
+                    display_val = f"<b>{batch_entry}</b><br><span style='font-size:11px; color:#38bdf8;'>[1 Combined Bulk Lecture ({r_span} Hrs)]</span>"
                 if is_batch_lab:
                     display_val += f'<br><span class="blinking-batch-badge">YOUR {student_batch.upper()} LAB</span>'
 
-                html += f'<td class="{cell_class}">{display_val}{att_subtext}</td>'
+                span_attr = f' rowspan="{r_span}"' if r_span > 1 else ""
+                html += f'<td class="{cell_class}"{span_attr}>{display_val}{att_subtext}</td>'
             html += '</tr>'
         html += '</tbody></table>'
         return html
@@ -1548,11 +1818,11 @@ with sec5_wrapper:
         ])
 
         with tt_tab1:
-            st.caption(f"**Even Week Effective Dates:** 21–25 Sept | 5–9 Oct | 26–30 Oct | 9–13 Nov | 23–27 Nov 2026 (Showing Lab Attendance Specifically for **{student_batch}** | Target: {target_att_pct}%)")
+            st.caption(f"**Even Week Effective Dates:** 21–25 Sept | 5–9 Oct | 26–30 Oct | 9–13 Nov | 23–27 Nov 2026 (Bulk Lectures Merged | Showing Lab Attendance for **{student_batch}** | Target: {target_att_pct}%)")
             st.markdown(build_vertical_timetable_html(EVEN_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
 
         with tt_tab2:
-            st.caption(f"**Odd Week Effective Dates:** 7–11 Sept | 28 Sept–2 Oct | 12–16 Oct | 1–6 Nov | 16–20 Nov | 30 Nov–4 Dec 2026 (Showing Lab Attendance Specifically for **{student_batch}** | Target: {target_att_pct}%)")
+            st.caption(f"**Odd Week Effective Dates:** 7–11 Sept | 28 Sept–2 Oct | 12–16 Oct | 1–6 Nov | 16–20 Nov | 30 Nov–4 Dec 2026 (Bulk Lectures Merged | Showing Lab Attendance for **{student_batch}** | Target: {target_att_pct}%)")
             st.markdown(build_vertical_timetable_html(ODD_WEEK_TIMETABLE_GRID), unsafe_allow_html=True)
 
         with tt_tab3:
@@ -1654,26 +1924,12 @@ with sec5_wrapper:
             render_side_guide_card(
                 4,
                 4,
-                "Step 4: Batch-Specific Lab Timetable & Image Manager",
-                "This arrow points to Section 5. Labs now filter automatically to show ONLY your chosen Batch (A, B, or C) and its attendance. Click 'Got it' to finish the tour permanently!",
+                "Step 4: Merged Bulk Timetable & Batch Lab Attendance",
+                "This arrow points to Section 5. Multi-hour bulk lectures like CP and 2-hour labs are merged into 1 combined block, and your batch labs highlight automatically. Click 'Got it' to finish!",
                 "dashboard_guide_step",
                 arrow_dir="left",
                 finish_tour=True,
             )
-
-# --- EXCLUSIVE ADMIN LOG (VISIBLE ONLY WHEN LOGGED IN AS KANISHKA'S GMAIL + VERIFIED PASSWORD) ---
-if (
-    st.session_state.get("student_logged_in", False)
-    and st.session_state.get("student_email", "").strip().lower() == ADMIN_EMAIL
-):
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("View Student Log (Exclusive Admin Access)", expanded=False):
-        if os.path.exists(VISITOR_LOG_FILE):
-            log_df = pd.read_csv(VISITOR_LOG_FILE)
-            log_df.index = range(1, len(log_df) + 1)
-            st.dataframe(log_df, width="stretch")
-        else:
-            st.write("No students have logged in yet.")
 
 # --- FOOTER SUBHEADING ---
 st.markdown(
