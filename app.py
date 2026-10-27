@@ -58,7 +58,7 @@ def get_admin_password_hash() -> str:
             return str(st.secrets["ADMIN_PASSWORD_HASH"]).strip().lower()
     except Exception:
         pass
-    # Irreversible SHA-256 hash of your admin password (no plain-text password in code!)
+   
     return "341e4d0758c9b07c8671ab4fc1be9e3121a9f199c7424e4c924136461586f861"
 
 
